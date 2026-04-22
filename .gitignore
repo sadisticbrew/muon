@@ -1,0 +1,15 @@
+# Compiled binaries
+muon
+*.o
+
+# eBPF Generated files
+bpf_bpfeb.go
+bpf_bpfel.go
+bpf_bpfeb.o
+bpf_bpfel.o
+
+# Kernel headers (do not push)
+vmlinux.h
+
+# Development logs
+session_log.txt
