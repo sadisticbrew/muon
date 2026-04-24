@@ -3,10 +3,10 @@ muon
 *.o
 
 # eBPF Generated files
-bpf_bpfeb.go
-bpf_bpfel.go
-bpf_bpfeb.o
-bpf_bpfel.o
+*_bpfeb.go
+*_bpfel.go
+*_bpfeb.o
+*_bpfel.o
 
 # Kernel headers (do not push)
 vmlinux.h
