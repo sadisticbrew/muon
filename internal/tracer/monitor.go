@@ -3,7 +3,6 @@ package tracer
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"log"
 	"net/netip"
 	"os"
@@ -41,18 +40,17 @@ func Monitor(targetPid uint32) {
 	if err != nil {
 		log.Fatalf("Failed to load bpf: %v", err)
 	}
-
 	if err := spec.Variables["target_pid"].Set(targetPid); err != nil {
 		log.Fatalf("Failed to set target_pid: %v", err)
 	}
 
-	fmt.Println("Running program with target_pid set to", targetPid)
-
 	var objs ebpf.MuonObjects
-	if err := ebpf.LoadMuonObjects(&objs, nil); err != nil {
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("Failed to load objects: %v", err)
 	}
 	defer objs.Close()
+
+	log.Println("Running program with target_pid set to", targetPid)
 
 	// --------------------------tracepoints------------------------------
 

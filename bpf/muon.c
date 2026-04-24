@@ -7,6 +7,8 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 
 volatile const __u32 target_pid;
 
+
+
 struct event {
     __u32 pid;
     __u32 type;
@@ -25,11 +27,16 @@ struct {
 
 } events SEC(".maps");
 
+SEC("socket") int const_example() {
+    return target_pid;
+}
+
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_execve(struct trace_event_raw_sys_enter *ctx) {
-    struct event *e;
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != target_pid) return 0;
+    if (target_pid != 0 && pid != target_pid) return 0;
+
+    struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         static const char fmt[] = "THE BUFFER IS FULL!";
@@ -53,10 +60,10 @@ int trace_execve(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_openat")
 int trace_openat(struct trace_event_raw_sys_enter *ctx) {
-    struct event *e;
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != target_pid) return 0;
+    if (target_pid != 0 && pid != target_pid) return 0;
 
+    struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
     e->type = 1;
@@ -76,9 +83,10 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_exit")
 int trace_exit(struct trace_event_raw_sys_enter *ctx) {
-    struct event *e;
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != target_pid) return 0;
+    if (target_pid != 0 && pid != target_pid) return 0;
+
+    struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
     e->type = 2;
@@ -102,9 +110,14 @@ int trace_exit(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_connect")
 int trace_connect(struct trace_event_raw_sys_enter *ctx) {
-    struct event *e;
+    char msg[] = "Target PID: %lu\n";
+    bpf_trace_printk(msg, sizeof(msg), (unsigned long)target_pid);
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (pid != target_pid) return 0;
+    char msg2[] = "Target PID: %u, current PID: %u\n";
+    bpf_trace_printk(msg2, sizeof(msg2), target_pid, pid);
+    if (target_pid != 0 && pid != target_pid) return 0;
+
+    struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) return 0;
     e->type = 3;
