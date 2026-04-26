@@ -50,6 +50,8 @@ func Monitor(targetPid uint32) {
 	}
 	defer objs.Close()
 
+	objs.MuonMaps.TrackedPids.Put(&targetPid, &targetPid)
+
 	log.Println("Running program with target_pid set to", targetPid)
 
 	// --------------------------tracepoints------------------------------
@@ -72,11 +74,23 @@ func Monitor(targetPid uint32) {
 	}
 	defer tp_enter_exit.Close()
 
+	tp_enter_exit_group, err := link.Tracepoint("syscalls", "sys_enter_exit_group", objs.TraceExit, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_enter_exit_group.Close()
+
 	tp_enter_connect, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
 	if err != nil {
 		log.Fatalf("Failed to open tracepoint: %v", err)
 	}
 	defer tp_enter_connect.Close()
+
+	tp_sched_process_fork, err := link.Tracepoint("sched", "sched_process_fork", objs.TraceForkAndClone, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_sched_process_fork.Close()
 
 	// -------------------------------------------------------
 
@@ -125,6 +139,7 @@ func Monitor(targetPid uint32) {
 	}()
 
 	stopper := make(chan os.Signal, 1)
+
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 	<-stopper
 	log.Println("Exiting Muon...")
