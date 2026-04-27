@@ -33,6 +33,13 @@ struct {
     __type(value, __u32);
 } tracked_pids SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} drop_counter SEC(".maps");
+
 SEC("socket") int const_example() {
     return target_pid;
 }
@@ -45,8 +52,11 @@ int trace_execve(struct trace_event_raw_sys_enter *ctx) {
     struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
-        static const char fmt[] = "THE BUFFER IS FULL!";
-        bpf_trace_printk(fmt, sizeof(fmt));
+        __u32 key = 0;
+        __u64 *count = bpf_map_lookup_elem(&drop_counter, &key);
+        if (count) {
+            __sync_fetch_and_add(count, 1);
+        }
         return 0;}
     e->type = 0;
     e->pid = pid;

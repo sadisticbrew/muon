@@ -143,6 +143,25 @@ func Monitor(targetPid uint32) {
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 	<-stopper
 	log.Println("Exiting Muon...")
+
+	var key uint32 = 0
+	// Because it's a Per-CPU array, we get a slice of values (one for each CPU core)
+	var perCPUCounts []uint64
+
+	err = objs.MuonMaps.DropCounter.Lookup(&key, &perCPUCounts)
+	if err == nil {
+		var totalDrops uint64 = 0
+		for _, count := range perCPUCounts {
+			totalDrops += count
+		}
+		if totalDrops > 0 {
+			log.Printf("WARNING: Ring buffer was full! Dropped %d events.\n", totalDrops)
+		} else {
+			log.Println("Success: 0 events dropped!")
+		}
+	} else {
+		log.Printf("Failed to read drop counter: %v", err)
+	}
 }
 
 func parseRawAddr(event Event) {

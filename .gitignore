@@ -12,4 +12,7 @@ muon
 vmlinux.h
 
 # Development logs
+clean.py
+comparison.diff
 session_log.txt
+cleaned_log.txt
