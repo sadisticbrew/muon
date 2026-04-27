@@ -44,31 +44,19 @@ SEC("socket") int const_example() {
     return target_pid;
 }
 
-SEC("tracepoint/syscalls/sys_enter_execve")
-int trace_execve(struct trace_event_raw_sys_enter *ctx) {
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;// bpf_get_current_pid_tgid() returns the thread group ID (which user space calls PID) in the upper 32 bits, and the thread ID in the lower 32 bits.
-    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
-
-    struct event *e;
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+// ----------Helper funcs--------------
+int is_event_empty(struct event *e) {
     if (!e) {
         __u32 key = 0;
         __u64 *count = bpf_map_lookup_elem(&drop_counter, &key);
         if (count) {
             __sync_fetch_and_add(count, 1);
         }
-        return 0;}
-    e->type = 0;
-    e->pid = pid;
-
-    char *filename = (char *)ctx->args[0];
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    int res = bpf_probe_read_user_str(&e->fname, sizeof(e->fname), filename);
-
-    bpf_ringbuf_submit(e, 0);
-
+        return 1;}
     return 0;
 }
+
+// --------------------------------------
 
 SEC("tracepoint/syscalls/sys_enter_openat")
 int trace_openat(struct trace_event_raw_sys_enter *ctx) {
@@ -78,7 +66,7 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx) {
 
     struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) return 0;
+    if (is_event_empty(e)) return 0;
     e->type = 1;
 
     e->pid =pid;
@@ -94,33 +82,6 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx) {
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_exit")
-int trace_exit(struct trace_event_raw_sys_enter *ctx) {
-
-    //need to make sure that the thing exiting is the main process (the thread group leader) and not just a temporary worker thread.
-    __u64 id = bpf_get_current_pid_tgid();
-    __u32 tgid = id >> 32;
-    __u32 tid = id;
-
-    // Ignore temporary worker threads exiting
-    if (tgid != tid) return 0;
-
-    __u32 pid = tgid;
-
-    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
-    bpf_map_delete_elem(&tracked_pids, &pid);
-
-    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) return 0;
-
-    e->type = 2; // Exit event
-    e->pid = pid;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
-
 SEC("tracepoint/syscalls/sys_enter_connect")
 int trace_connect(struct trace_event_raw_sys_enter *ctx) {
     __u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -128,7 +89,7 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
 
     struct event *e;
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) return 0;
+    if (is_event_empty(e)) return 0;
     e->type = 3;
 
     e->pid = pid;
@@ -152,5 +113,55 @@ int trace_forkAndClone(struct trace_event_raw_sched_process_fork *ctx) {
 
     int res = bpf_map_update_elem(&tracked_pids, &pid, &pid, BPF_ANY);
 
+    return 0;
+}
+
+
+SEC("tracepoint/sched/sched_process_exit")
+int trace_process_exit(struct trace_event_raw_sched_process_exit *ctx) {
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 tgid = id >> 32;
+    __u32 tid = id;
+
+    // Ignore temporary worker threads exiting
+    if (tgid != tid) return 0;
+
+    __u32 pid = tgid;
+
+    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+    bpf_map_delete_elem(&tracked_pids, &pid);
+
+    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    e->type = 2; // Exit event
+    e->pid = pid;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+
+    return 0;
+}
+
+
+SEC("tracepoint/sched/sched_process_exec")
+int trace_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;// bpf_get_current_pid_tgid() returns the thread group ID (which user space calls PID) in the upper 32 bits, and the thread ID in the lower 32 bits.
+    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+
+    struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (is_event_empty(e)) return 0;
+
+    e->type = 0; // Exec event
+    e->pid = pid;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    // Locate the filename
+    __u16 filename_loc = (uint16_t)BPF_CORE_READ(ctx, __data_loc_filename);
+    // Read the filename from the context
+    bpf_probe_read_str(&e->fname, sizeof(e->fname), (void *)ctx + filename_loc);
+
+
+    bpf_ringbuf_submit(e, 0);
     return 0;
 }

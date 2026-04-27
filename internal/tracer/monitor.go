@@ -56,29 +56,11 @@ func Monitor(targetPid uint32) {
 
 	// --------------------------tracepoints------------------------------
 
-	tp_execve, err := link.Tracepoint("syscalls", "sys_enter_execve", objs.TraceExecve, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_execve.Close()
-
 	tp_openat, err := link.Tracepoint("syscalls", "sys_enter_openat", objs.TraceOpenat, nil)
 	if err != nil {
 		log.Fatalf("Failed to open tracepoint: %v", err)
 	}
 	defer tp_openat.Close()
-
-	tp_enter_exit, err := link.Tracepoint("syscalls", "sys_enter_exit", objs.TraceExit, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_enter_exit.Close()
-
-	tp_enter_exit_group, err := link.Tracepoint("syscalls", "sys_enter_exit_group", objs.TraceExit, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_enter_exit_group.Close()
 
 	tp_enter_connect, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
 	if err != nil {
@@ -91,6 +73,18 @@ func Monitor(targetPid uint32) {
 		log.Fatalf("Failed to open tracepoint: %v", err)
 	}
 	defer tp_sched_process_fork.Close()
+
+	tp_process_exit, err := link.Tracepoint("sched", "sched_process_exit", objs.TraceProcessExit, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_process_exit.Close()
+
+	tp_execve, err := link.Tracepoint("sched", "sched_process_exec", objs.TraceProcessExec, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_execve.Close()
 
 	// -------------------------------------------------------
 
