@@ -170,14 +170,14 @@ func parseRawAddr(event Event) {
 	switch family {
 	case syscall.AF_INET:
 		port := binary.BigEndian.Uint16(event.RawAddr[2:4])
-		addr, ok := netip.AddrFromSlice(bytes.Trim(event.RawAddr[4:8], "\x00"))
+		addr, ok := netip.AddrFromSlice(event.RawAddr[4:8])
 		if !ok {
 			log.Println("Invalid address: ", event.RawAddr[4:])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
 	case syscall.AF_INET6:
 		port := binary.BigEndian.Uint16(event.RawAddr[2:4])
-		addr, ok := netip.AddrFromSlice(bytes.Trim(event.RawAddr[8:24], "\x00"))
+		addr, ok := netip.AddrFromSlice(event.RawAddr[8:24])
 		if !ok {
 			log.Println("Invalid address: ", event.RawAddr[8:24])
 		}
