@@ -17,11 +17,12 @@ import (
 )
 
 type Event struct {
-	PID     uint32
-	Type    uint32
-	Comm    [16]byte
-	Fname   [256]byte
-	RawAddr [128]byte
+	PID  uint32
+	Type uint32
+	Comm [16]byte
+	Data struct {
+		Data [256]byte
+	}
 }
 
 type ConnectCall struct {
@@ -113,12 +114,18 @@ func Monitor(targetPid uint32) {
 				continue
 			}
 
-			fname := string(bytes.Trim((event.Fname[:]), "\x00"))
-
+			nullIdx := bytes.Index(event.Data.Data[:], []byte{0})
+			var fname string
+			if nullIdx == -1 {
+				fname = string(event.Data.Data[:])
+			} else {
+				fname = string(event.Data.Data[:nullIdx])
+			}
 			switch event.Type {
 			case 0:
 				log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 			case 1: //temporarily ignoring openat calls due to it's high volume
+
 				log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 			case 2:
 				log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
@@ -159,25 +166,25 @@ func Monitor(targetPid uint32) {
 }
 
 func parseRawAddr(event Event) {
-	family := binary.NativeEndian.Uint16(event.RawAddr[0:2])
+	family := binary.NativeEndian.Uint16(event.Data.Data[0:2])
 	log.Println(family)
 	switch family {
 	case syscall.AF_INET:
-		port := binary.BigEndian.Uint16(event.RawAddr[2:4])
-		addr, ok := netip.AddrFromSlice(event.RawAddr[4:8])
+		port := binary.BigEndian.Uint16(event.Data.Data[2:4])
+		addr, ok := netip.AddrFromSlice(event.Data.Data[4:8])
 		if !ok {
-			log.Println("Invalid address: ", event.RawAddr[4:])
+			log.Println("Invalid address: ", event.Data.Data[4:8])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
 	case syscall.AF_INET6:
-		port := binary.BigEndian.Uint16(event.RawAddr[2:4])
-		addr, ok := netip.AddrFromSlice(event.RawAddr[8:24])
+		port := binary.BigEndian.Uint16(event.Data.Data[2:4])
+		addr, ok := netip.AddrFromSlice(event.Data.Data[8:24])
 		if !ok {
-			log.Println("Invalid address: ", event.RawAddr[8:24])
+			log.Println("Invalid address: ", event.Data.Data[8:24])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
 	case syscall.AF_UNIX:
-		addr := string(bytes.Trim(event.RawAddr[2:], "\x00"))
+		addr := string(bytes.Trim(event.Data.Data[2:], "\x00"))
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s\n", event.PID, string(event.Comm[:]), addr)
 	}
 }

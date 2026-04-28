@@ -14,12 +14,11 @@ struct event {
     __u32 pid;
     __u32 type;
     char comm[16];
-    char fname[256];
-    // struct connect_call call;
-    unsigned char raw_addr[128];
+    union {
+        char fname[256];
+        unsigned char raw_addr[128];
+    } data;
 };
-
-
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -28,7 +27,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1 << 24);
+    __uint(max_entries, 1 << 14);
     __type(key, __u32);
     __type(value, __u32);
 } tracked_pids SEC(".maps");
@@ -50,7 +49,7 @@ int is_event_empty(struct event *e) {
         __u32 key = 0;
         __u64 *count = bpf_map_lookup_elem(&drop_counter, &key);
         if (count) {
-            __sync_fetch_and_add(count, 1);
+            *count += 1;
         }
         return 1;}
     return 0;
@@ -74,8 +73,11 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx) {
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
     char *fname = (char *)ctx->args[1];
-    int res = bpf_probe_read_user_str(&e->fname, sizeof(e->fname), fname);
-
+    int res = bpf_probe_read_user_str(&e->data.fname, sizeof(e->data.fname), fname);
+    if (res < 0) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
 
     bpf_ringbuf_submit(e, 0);
 
@@ -98,7 +100,11 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
 
     void *addr_ptr = (void *)ctx->args[1];
 
-    bpf_probe_read_user(&e->raw_addr, sizeof(e->raw_addr), addr_ptr);
+    int res = bpf_probe_read_user(&e->data.raw_addr, sizeof(e->data.raw_addr), addr_ptr);
+    if (res < 0) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -111,7 +117,7 @@ int trace_forkAndClone(struct trace_event_raw_sched_process_fork *ctx) {
     __u32 ppid = bpf_get_current_pid_tgid() >> 32;
     if (!bpf_map_lookup_elem(&tracked_pids, &ppid)) return 0;
 
-    int res = bpf_map_update_elem(&tracked_pids, &pid, &pid, BPF_ANY);
+    bpf_map_update_elem(&tracked_pids, &pid, &pid, BPF_ANY);
 
     return 0;
 }
@@ -132,7 +138,7 @@ int trace_process_exit(struct trace_event_raw_sched_process_exit *ctx) {
     bpf_map_delete_elem(&tracked_pids, &pid);
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) return 0;
+    if (is_event_empty(e)) return 0;
 
     e->type = 2; // Exit event
     e->pid = pid;
@@ -159,8 +165,11 @@ int trace_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
     // Locate the filename
     __u16 filename_loc = (uint16_t)BPF_CORE_READ(ctx, __data_loc_filename);
     // Read the filename from the context
-    bpf_probe_read_str(&e->fname, sizeof(e->fname), (void *)ctx + filename_loc);
-
+    int res = bpf_probe_read_str(&e->data.fname, sizeof(e->data.fname), (void *)ctx + filename_loc);
+    if (res < 0) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
+    }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
