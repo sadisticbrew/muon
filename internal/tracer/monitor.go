@@ -2,11 +2,13 @@ package tracer
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"log"
 	"net/netip"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"muon/internal/ebpf"
@@ -88,7 +90,6 @@ func Monitor(targetPid uint32) {
 	defer tp_execve.Close()
 
 	// -------------------------------------------------------
-
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("Failed to open ringbuf reader: %v", err)
@@ -97,53 +98,63 @@ func Monitor(targetPid uint32) {
 
 	log.Println("Muon is running! Waiting for openat calls... (Press Ctrl+C to stop)")
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
 	// If you remove the go keyword, bad things might happen.
-	go func() {
+	go func(ctx context.Context) {
+		defer wg.Done()
 		var event Event
 		for {
-
-			record, err := rd.Read()
-			if err != nil {
-				log.Printf("Error reading from ring buffer: %v", err)
-				continue
-			}
-
-			if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
-				log.Println(event)
-				log.Printf("Error parsing event: %v", err)
-				continue
-			}
-
-			nullIdx := bytes.Index(event.Data.Data[:], []byte{0})
-			var fname string
-			if nullIdx == -1 {
-				fname = string(event.Data.Data[:])
-			} else {
-				fname = string(event.Data.Data[:nullIdx])
-			}
-			switch event.Type {
-			case 0:
-				log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
-			case 1: //temporarily ignoring openat calls due to it's high volume
-
-				log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
-			case 2:
-				log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
-			case 3:
-				parseRawAddr(event)
+			select {
+			case <-ctx.Done():
+				return
 			default:
-				if event.Type != 1 {
-					log.Printf("[unknown] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+				record, err := rd.Read()
+				if err != nil {
+					if err == ringbuf.ErrClosed {
+						return
+					}
+					log.Printf("Error reading from ring buffer: %v", err)
+					continue
+				}
+
+				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
+					log.Println(event)
+					log.Printf("Error parsing event: %v", err)
+					continue
+				}
+
+				switch event.Type {
+				case 0:
+					fname := make_filename(event)
+					log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+				case 1: //temporarily ignoring openat calls due to it's high volume
+					fname := make_filename(event)
+					log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+				case 2:
+					log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
+				case 3:
+					parseRawAddr(event)
+
+				default:
+					if event.Type != 1 {
+						fname := make_filename(event)
+						log.Printf("[unknown] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+					}
 				}
 			}
 		}
-	}()
+	}(ctx)
 
-	stopper := make(chan os.Signal, 1)
-
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-	<-stopper
+	<-ctx.Done()
+	rd.Close()
 	log.Println("Exiting Muon...")
+	wg.Wait()
+	log.Println("Exit successful.")
 
 	var key uint32 = 0
 	// Because it's a Per-CPU array, we get a slice of values (one for each CPU core)
@@ -187,4 +198,15 @@ func parseRawAddr(event Event) {
 		addr := string(bytes.Trim(event.Data.Data[2:], "\x00"))
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s\n", event.PID, string(event.Comm[:]), addr)
 	}
+}
+
+func make_filename(event Event) string {
+	nullIdx := bytes.Index(event.Data.Data[:], []byte{0})
+	var fname string
+	if nullIdx == -1 {
+		fname = string(event.Data.Data[:])
+	} else {
+		fname = string(event.Data.Data[:nullIdx])
+	}
+	return fname
 }
