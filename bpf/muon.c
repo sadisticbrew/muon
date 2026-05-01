@@ -3,12 +3,21 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
 volatile const __u32 target_pid;
 
+struct mmap_temp{
+    __u32 pid;
+    __u64 size;
+};
 
+struct mmap_event {
+    __u64 addr;
+    __u64 size;
+};
 
 struct event {
     __u32 pid;
@@ -17,6 +26,7 @@ struct event {
     union {
         char fname[256];
         unsigned char raw_addr[128];
+        struct mmap_event mmap_data;
     } data;
 };
 
@@ -39,9 +49,12 @@ struct {
     __type(value, __u64);
 } drop_counter SEC(".maps");
 
-SEC("socket") int const_example() {
-    return target_pid;
-}
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1 << 14);
+    __type(key, __u64);
+    __type(value, struct mmap_temp);
+} pending_mmaps SEC(".maps");
 
 // ----------Helper funcs--------------
 int is_event_empty(struct event *e) {
@@ -110,6 +123,48 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
     return 0;
 }
 
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int trace_mmap(struct trace_event_raw_sys_enter *ctx){
+    __u64 id =  bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+
+    __u64 key = id;
+    struct mmap_temp md = { .pid = pid, .size = ctx->args[1] };
+    bpf_map_update_elem(&pending_mmaps, &key, &md, BPF_ANY);
+
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int trace_mmap_exit(struct trace_event_raw_sys_exit *ctx){
+    __u64 id =  bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+
+    __u64 key = id;
+    struct mmap_temp *md;
+    md = bpf_map_lookup_elem(&pending_mmaps, &key);
+    bpf_map_delete_elem(&pending_mmaps, &key);
+    if (!(md)) return 0;
+    if (md->pid != pid) return 0;
+
+    long res = ctx->ret;
+    if (res < 0) return 0;
+
+    struct event *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (is_event_empty(e)) return 0;
+
+    e->type = 4;
+    e->pid = pid;
+    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    e->data.mmap_data.addr = res;
+    e->data.mmap_data.size = md->size;
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
 
 SEC("tracepoint/sched/sched_process_fork")
 int trace_forkAndClone(struct trace_event_raw_sched_process_fork *ctx) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net/netip"
 	"os"
@@ -22,15 +23,13 @@ type Event struct {
 	PID  uint32
 	Type uint32
 	Comm [16]byte
-	Data struct {
-		Data [256]byte
-	}
+	Data [256]byte
 }
 
-type ConnectCall struct {
-	Addr   [16]byte
-	Port   [6]byte
-	Family uint16
+type AllocEventData struct {
+	Addr uint64
+	// _    uint32
+	Size uint64
 }
 
 func Monitor(targetPid uint32) {
@@ -89,6 +88,18 @@ func Monitor(targetPid uint32) {
 	}
 	defer tp_execve.Close()
 
+	tp_mmap, err := link.Tracepoint("syscalls", "sys_enter_mmap", objs.TraceMmap, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_mmap.Close()
+
+	tp_mmap_exit, err := link.Tracepoint("syscalls", "sys_exit_mmap", objs.TraceMmapExit, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_mmap_exit.Close()
+
 	// -------------------------------------------------------
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -130,19 +141,28 @@ func Monitor(targetPid uint32) {
 
 				switch event.Type {
 				case 0:
-					fname := make_filename(event)
+					fname := makeFilename(event)
 					log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 				case 1: //temporarily ignoring openat calls due to it's high volume
-					fname := make_filename(event)
+					fname := makeFilename(event)
 					log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 				case 2:
 					log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
 				case 3:
 					parseRawAddr(event)
+				case 4:
+					var allocData AllocEventData
+					alloc_rd := bytes.NewReader(event.Data[:])
 
+					err := binary.Read(alloc_rd, binary.LittleEndian, &allocData)
+					if err != nil {
+						fmt.Println("Failed to parse alloc_data:", err)
+						return
+					}
+					log.Printf("[mmap] - pid: %d, comm: %s, size: %d, addr: %x\n", event.PID, string(event.Comm[:]), allocData.Size, allocData.Addr)
 				default:
 					if event.Type != 1 {
-						fname := make_filename(event)
+						fname := makeFilename(event)
 						log.Printf("[unknown] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 					}
 				}
@@ -177,36 +197,36 @@ func Monitor(targetPid uint32) {
 }
 
 func parseRawAddr(event Event) {
-	family := binary.NativeEndian.Uint16(event.Data.Data[0:2])
+	family := binary.NativeEndian.Uint16(event.Data[0:2])
 	log.Println(family)
 	switch family {
 	case syscall.AF_INET:
-		port := binary.BigEndian.Uint16(event.Data.Data[2:4])
-		addr, ok := netip.AddrFromSlice(event.Data.Data[4:8])
+		port := binary.BigEndian.Uint16(event.Data[2:4])
+		addr, ok := netip.AddrFromSlice(event.Data[4:8])
 		if !ok {
-			log.Println("Invalid address: ", event.Data.Data[4:8])
+			log.Println("Invalid address: ", event.Data[4:8])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
 	case syscall.AF_INET6:
-		port := binary.BigEndian.Uint16(event.Data.Data[2:4])
-		addr, ok := netip.AddrFromSlice(event.Data.Data[8:24])
+		port := binary.BigEndian.Uint16(event.Data[2:4])
+		addr, ok := netip.AddrFromSlice(event.Data[8:24])
 		if !ok {
-			log.Println("Invalid address: ", event.Data.Data[8:24])
+			log.Println("Invalid address: ", event.Data[8:24])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
 	case syscall.AF_UNIX:
-		addr := string(bytes.Trim(event.Data.Data[2:], "\x00"))
+		addr := string(bytes.Trim(event.Data[2:], "\x00"))
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s\n", event.PID, string(event.Comm[:]), addr)
 	}
 }
 
-func make_filename(event Event) string {
-	nullIdx := bytes.Index(event.Data.Data[:], []byte{0})
+func makeFilename(event Event) string {
+	nullIdx := bytes.Index(event.Data[:], []byte{0})
 	var fname string
 	if nullIdx == -1 {
-		fname = string(event.Data.Data[:])
+		fname = string(event.Data[:])
 	} else {
-		fname = string(event.Data.Data[:nullIdx])
+		fname = string(event.Data[:nullIdx])
 	}
 	return fname
 }
