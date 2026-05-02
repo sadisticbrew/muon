@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
@@ -16,9 +17,16 @@ import (
 
 	"github.com/dustin/go-humanize"
 
+	gebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+)
+
+const (
+	ALLOC           uint16 = 0
+	FREE            uint16 = 1
+	FREE_NO_HISTORY uint16 = 2
 )
 
 type Event struct {
@@ -30,8 +38,8 @@ type Event struct {
 
 type AllocEventData struct {
 	Addr uint64
-	// _    uint32
 	Size uint64
+	Flag uint16
 }
 
 func Monitor(targetPid uint32) {
@@ -50,7 +58,14 @@ func Monitor(targetPid uint32) {
 
 	var objs ebpf.MuonObjects
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		log.Fatalf("Failed to load objects: %v", err)
+		// log.Fatalf("Failed to load objects: %v", err)
+		var ve *gebpf.VerifierError
+		if errors.As(err, &ve) {
+			// Use %+v to print the full verifier log including instruction history
+			fmt.Printf("Detailed Verifier Error:\n%+v\n", ve)
+		} else {
+			fmt.Printf("Load failed: %v\n", err)
+		}
 	}
 	defer objs.Close()
 
@@ -114,6 +129,13 @@ func Monitor(targetPid uint32) {
 	}
 	defer tp_brk_exit.Close()
 
+	tp_munmap, err := link.Tracepoint("syscalls", "sys_enter_munmap", objs.TraceMunmap, nil)
+	log.Println("tp_munmap:", tp_munmap)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_munmap.Close()
+
 	// -------------------------------------------------------
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -171,10 +193,18 @@ func Monitor(targetPid uint32) {
 
 					err := binary.Read(alloc_rd, binary.LittleEndian, &allocData)
 					if err != nil {
-						fmt.Println("Failed to parse alloc_data:", err)
+						log.Println("Failed to parse alloc_data:", err)
 						continue
 					}
-					log.Printf("[mmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+					// log.Println(allocData.Flag)
+					switch allocData.Flag {
+					case ALLOC:
+						log.Printf("[mmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+					case FREE:
+						log.Printf("[munmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+					case FREE_NO_HISTORY:
+						log.Printf("[munmap_no_history] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+					}
 				case 5:
 					var brkData AllocEventData
 					brk_rd := bytes.NewReader(event.Data[:])
@@ -190,6 +220,7 @@ func Monitor(targetPid uint32) {
 						log.Printf("[unknown] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 					}
 				}
+
 			}
 		}
 	}(ctx)
