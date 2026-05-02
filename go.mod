@@ -6,6 +6,7 @@ tool github.com/cilium/ebpf/cmd/bpf2go
 
 require (
 	github.com/cilium/ebpf v0.21.0
+	github.com/dustin/go-humanize v1.0.1
 	github.com/spf13/cobra v1.10.2
 )
 

@@ -14,10 +14,15 @@ struct mmap_temp{
     __u64 size;
 };
 
-struct mmap_event {
+struct brk_temp {
+    __u64 old;
+};
+
+struct alloc_event {
     __u64 addr;
     __u64 size;
 };
+
 
 struct event {
     __u32 pid;
@@ -26,7 +31,7 @@ struct event {
     union {
         char fname[256];
         unsigned char raw_addr[128];
-        struct mmap_event mmap_data;
+        struct alloc_event alloc_data;
     } data;
 };
 
@@ -55,6 +60,13 @@ struct {
     __type(key, __u64);
     __type(value, struct mmap_temp);
 } pending_mmaps SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1 << 14);
+    __type(key, __u64);
+    __type(value, struct brk_temp);
+} pending_brks SEC(".maps");
 
 // ----------Helper funcs--------------
 int is_event_empty(struct event *e) {
@@ -135,7 +147,6 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx){
 
     return 0;
 }
-
 SEC("tracepoint/syscalls/sys_exit_mmap")
 int trace_mmap_exit(struct trace_event_raw_sys_exit *ctx){
     __u64 id =  bpf_get_current_pid_tgid();
@@ -143,11 +154,12 @@ int trace_mmap_exit(struct trace_event_raw_sys_exit *ctx){
     if (!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
 
     __u64 key = id;
-    struct mmap_temp *md;
-    md = bpf_map_lookup_elem(&pending_mmaps, &key);
+    struct mmap_temp *md_ptr;
+    md_ptr = (struct mmap_temp *)bpf_map_lookup_elem(&pending_mmaps, &key);
+    if (!(md_ptr)) return 0;
+    struct mmap_temp md = *md_ptr;
     bpf_map_delete_elem(&pending_mmaps, &key);
-    if (!(md)) return 0;
-    if (md->pid != pid) return 0;
+    if (md.pid != pid) return 0;
 
     long res = ctx->ret;
     if (res < 0) return 0;
@@ -159,12 +171,62 @@ int trace_mmap_exit(struct trace_event_raw_sys_exit *ctx){
     e->type = 4;
     e->pid = pid;
     bpf_get_current_comm(e->comm, sizeof(e->comm));
-    e->data.mmap_data.addr = res;
-    e->data.mmap_data.size = md->size;
+    e->data.alloc_data.addr = res;
+    e->data.alloc_data.size = md.size;
 
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
+
+SEC("tracepoint/syscalls/sys_enter_brk")
+int trace_brk(struct trace_event_raw_sys_enter *ctx) {
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    if(!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+
+    __u64 req_addr = ctx->args[0];
+    if (req_addr == 0) return 0;
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+    struct brk_temp curr_break = { .old = BPF_CORE_READ(task, mm, brk) };
+
+    bpf_map_update_elem(&pending_brks, &id, &curr_break, BPF_ANY);
+
+    return 0;
+}
+SEC("tracepoint/syscalls/sys_exit_brk")
+int trace_brk_exit(struct trace_event_raw_sys_exit *ctx) {
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    if(!bpf_map_lookup_elem(&tracked_pids, &pid)) return 0;
+
+    struct brk_temp *old_break = bpf_map_lookup_elem(&pending_brks, &id);
+    if (!old_break) return 0;
+    bpf_map_delete_elem(&pending_brks, &id);
+
+    __u64 new_brk = ctx->ret;
+    if (new_brk == old_break->old) return 0;
+
+    struct event *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (is_event_empty(e)) return 0;
+
+    e->pid = pid;
+    e->type = 5;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    if (new_brk > old_break->old) {
+        e->data.alloc_data.size = new_brk - old_break->old;
+    } else {
+        e->data.alloc_data.size = old_break->old - new_brk;
+    }
+    e->data.alloc_data.addr = new_brk;
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+
 
 SEC("tracepoint/sched/sched_process_fork")
 int trace_forkAndClone(struct trace_event_raw_sched_process_fork *ctx) {

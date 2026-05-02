@@ -14,6 +14,8 @@ import (
 
 	"muon/internal/ebpf"
 
+	"github.com/dustin/go-humanize"
+
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -100,6 +102,18 @@ func Monitor(targetPid uint32) {
 	}
 	defer tp_mmap_exit.Close()
 
+	tp_brk, err := link.Tracepoint("syscalls", "sys_enter_brk", objs.TraceBrk, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_brk.Close()
+
+	tp_brk_exit, err := link.Tracepoint("syscalls", "sys_exit_brk", objs.TraceBrkExit, nil)
+	if err != nil {
+		log.Fatalf("Failed to open tracepoint: %v", err)
+	}
+	defer tp_brk_exit.Close()
+
 	// -------------------------------------------------------
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -109,7 +123,8 @@ func Monitor(targetPid uint32) {
 
 	log.Println("Muon is running! Waiting for openat calls... (Press Ctrl+C to stop)")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var wg sync.WaitGroup
 
@@ -157,9 +172,18 @@ func Monitor(targetPid uint32) {
 					err := binary.Read(alloc_rd, binary.LittleEndian, &allocData)
 					if err != nil {
 						fmt.Println("Failed to parse alloc_data:", err)
-						return
+						continue
 					}
-					log.Printf("[mmap] - pid: %d, comm: %s, size: %d, addr: %x\n", event.PID, string(event.Comm[:]), allocData.Size, allocData.Addr)
+					log.Printf("[mmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+				case 5:
+					var brkData AllocEventData
+					brk_rd := bytes.NewReader(event.Data[:])
+					err := binary.Read(brk_rd, binary.LittleEndian, &brkData)
+					if err != nil {
+						fmt.Println("Failed to parse brk_data:", err)
+						continue
+					}
+					log.Printf("[brk] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(brkData.Size), brkData.Addr)
 				default:
 					if event.Type != 1 {
 						fname := makeFilename(event)
