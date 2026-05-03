@@ -4,137 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
-	"fmt"
 	"log"
-	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 
-	"muon/internal/ebpf"
+	"muon/internal/loader"
 
-	"github.com/dustin/go-humanize"
-
-	gebpf "github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit"
 )
-
-const (
-	ALLOC           uint16 = 0
-	FREE            uint16 = 1
-	FREE_NO_HISTORY uint16 = 2
-)
-
-type Event struct {
-	PID  uint32
-	Type uint32
-	Comm [16]byte
-	Data [256]byte
-}
-
-type AllocEventData struct {
-	Addr uint64
-	Size uint64
-	Flag uint16
-}
 
 func Monitor(targetPid uint32) {
-	// Allow the current process to lock memory for eBPF resources.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		log.Fatal(err)
-	}
 
-	spec, err := ebpf.LoadMuon()
-	if err != nil {
-		log.Fatalf("Failed to load bpf: %v", err)
-	}
-	if err := spec.Variables["target_pid"].Set(targetPid); err != nil {
-		log.Fatalf("Failed to set target_pid: %v", err)
-	}
-
-	var objs ebpf.MuonObjects
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		// log.Fatalf("Failed to load objects: %v", err)
-		var ve *gebpf.VerifierError
-		if errors.As(err, &ve) {
-			// Use %+v to print the full verifier log including instruction history
-			fmt.Printf("Detailed Verifier Error:\n%+v\n", ve)
-		} else {
-			fmt.Printf("Load failed: %v\n", err)
-		}
-	}
+	/*	Load and assign ebpf objects  */
+	objs := loader.Load(targetPid)
 	defer objs.Close()
 
-	objs.MuonMaps.TrackedPids.Put(&targetPid, &targetPid)
-
-	log.Println("Running program with target_pid set to", targetPid)
-
-	// --------------------------tracepoints------------------------------
-
-	tp_openat, err := link.Tracepoint("syscalls", "sys_enter_openat", objs.TraceOpenat, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_openat.Close()
-
-	tp_enter_connect, err := link.Tracepoint("syscalls", "sys_enter_connect", objs.TraceConnect, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_enter_connect.Close()
-
-	tp_sched_process_fork, err := link.Tracepoint("sched", "sched_process_fork", objs.TraceForkAndClone, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_sched_process_fork.Close()
-
-	tp_process_exit, err := link.Tracepoint("sched", "sched_process_exit", objs.TraceProcessExit, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_process_exit.Close()
-
-	tp_execve, err := link.Tracepoint("sched", "sched_process_exec", objs.TraceProcessExec, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_execve.Close()
-
-	tp_mmap, err := link.Tracepoint("syscalls", "sys_enter_mmap", objs.TraceMmap, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_mmap.Close()
-
-	tp_mmap_exit, err := link.Tracepoint("syscalls", "sys_exit_mmap", objs.TraceMmapExit, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_mmap_exit.Close()
-
-	tp_brk, err := link.Tracepoint("syscalls", "sys_enter_brk", objs.TraceBrk, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_brk.Close()
-
-	tp_brk_exit, err := link.Tracepoint("syscalls", "sys_exit_brk", objs.TraceBrkExit, nil)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_brk_exit.Close()
-
-	tp_munmap, err := link.Tracepoint("syscalls", "sys_enter_munmap", objs.TraceMunmap, nil)
-	log.Println("tp_munmap:", tp_munmap)
-	if err != nil {
-		log.Fatalf("Failed to open tracepoint: %v", err)
-	}
-	defer tp_munmap.Close()
+	/*link to tracepoints */
+	links := linkTracepoints(objs)
+	defer closeTracepoints(links)
 
 	// -------------------------------------------------------
 	rd, err := ringbuf.NewReader(objs.Events)
@@ -176,45 +65,9 @@ func Monitor(targetPid uint32) {
 					continue
 				}
 
-				switch event.Type {
-				case 0:
-					fname := makeFilename(event)
-					log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
-				case 1: //temporarily ignoring openat calls due to it's high volume
-					fname := makeFilename(event)
-					log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
-				case 2:
-					log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
-				case 3:
-					parseRawAddr(event)
-				case 4:
-					var allocData AllocEventData
-					alloc_rd := bytes.NewReader(event.Data[:])
-
-					err := binary.Read(alloc_rd, binary.LittleEndian, &allocData)
-					if err != nil {
-						log.Println("Failed to parse alloc_data:", err)
-						continue
-					}
-					// log.Println(allocData.Flag)
-					switch allocData.Flag {
-					case ALLOC:
-						log.Printf("[mmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
-					case FREE:
-						log.Printf("[munmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
-					case FREE_NO_HISTORY:
-						log.Printf("[munmap_no_history] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
-					}
-				case 5:
-					var brkData AllocEventData
-					brk_rd := bytes.NewReader(event.Data[:])
-					err := binary.Read(brk_rd, binary.LittleEndian, &brkData)
-					if err != nil {
-						fmt.Println("Failed to parse brk_data:", err)
-						continue
-					}
-					log.Printf("[brk] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(brkData.Size), brkData.Addr)
-				default:
+				if handler, ok := handlers[event.Type]; ok {
+					handler(event)
+				} else {
 					if event.Type != 1 {
 						fname := makeFilename(event)
 						log.Printf("[unknown] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
@@ -249,39 +102,4 @@ func Monitor(targetPid uint32) {
 	} else {
 		log.Printf("Failed to read drop counter: %v", err)
 	}
-}
-
-func parseRawAddr(event Event) {
-	family := binary.NativeEndian.Uint16(event.Data[0:2])
-	log.Println(family)
-	switch family {
-	case syscall.AF_INET:
-		port := binary.BigEndian.Uint16(event.Data[2:4])
-		addr, ok := netip.AddrFromSlice(event.Data[4:8])
-		if !ok {
-			log.Println("Invalid address: ", event.Data[4:8])
-		}
-		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
-	case syscall.AF_INET6:
-		port := binary.BigEndian.Uint16(event.Data[2:4])
-		addr, ok := netip.AddrFromSlice(event.Data[8:24])
-		if !ok {
-			log.Println("Invalid address: ", event.Data[8:24])
-		}
-		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
-	case syscall.AF_UNIX:
-		addr := string(bytes.Trim(event.Data[2:], "\x00"))
-		log.Printf("[connnect] pid: %d, comm: %s, addr: %s\n", event.PID, string(event.Comm[:]), addr)
-	}
-}
-
-func makeFilename(event Event) string {
-	nullIdx := bytes.Index(event.Data[:], []byte{0})
-	var fname string
-	if nullIdx == -1 {
-		fname = string(event.Data[:])
-	} else {
-		fname = string(event.Data[:nullIdx])
-	}
-	return fname
 }
