@@ -23,12 +23,12 @@ var attachCmd = &cobra.Command{
 			tea.WithAltScreen(), // Uses the alternate screen buffer (like vim/htop)
 			tea.WithMouseCellMotion(),
 		)
-		go tracer.Monitor(targetPid)
+		tracer.Monitor(targetPid, p)
 
-		_, err := p.Run()
-		if err != nil {
-			return err
-		}
+		// _, err := p.Run()
+		// if err != nil {
+		// 	return err
+		// }
 		return nil
 	},
 }

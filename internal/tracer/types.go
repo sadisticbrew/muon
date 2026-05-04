@@ -2,7 +2,6 @@ package tracer
 
 import (
 	"sync"
-	"time"
 )
 
 const (
@@ -32,7 +31,7 @@ type AllocKey struct {
 type ParsedEvent struct {
 	PID       uint32
 	Comm      string
-	Timestamp time.Time
+	Timestamp int64
 	Kind      string // "mmap", "munmap", "exec", "openat", etc.
 	Detail    string // "addr: 0x7f... size: 4KB" — pre-formatted for display
 }

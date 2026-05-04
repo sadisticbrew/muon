@@ -13,10 +13,14 @@ import (
 	"muon/internal/ebpf"
 	"muon/internal/loader"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cilium/ebpf/ringbuf"
 )
 
-func Monitor(targetPid uint32) {
+var parsedEventsMu sync.Mutex
+var parsedEvents []ParsedEvent
+
+func Monitor(targetPid uint32, p *tea.Program) {
 
 	/*	Load and assign ebpf objects  */
 	objs := loader.Load(targetPid)
@@ -49,6 +53,8 @@ func Monitor(targetPid uint32) {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Println(parsedEvents)
+
 				return
 			default:
 				record, err := rd.Read()
@@ -67,7 +73,8 @@ func Monitor(targetPid uint32) {
 				}
 
 				if handler, ok := handlers[event.Type]; ok {
-					handler(event, objs)
+					parsedEvent := handler(event, objs)
+					parsedEvents = append(parsedEvents, parsedEvent)
 				} else {
 					if event.Type != 1 {
 						fname := makeFilename(event)

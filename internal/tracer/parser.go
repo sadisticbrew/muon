@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-func parseRawAddr(event Event) {
+func parseRawAddr(event Event) (string, uint16) {
 	family := binary.NativeEndian.Uint16(event.Data[0:2])
 	log.Println(family)
 	switch family {
@@ -18,7 +18,8 @@ func parseRawAddr(event Event) {
 		if !ok {
 			log.Println("Invalid address: ", event.Data[4:8])
 		}
-		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
+		// log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
+		return addr.String(), port
 	case syscall.AF_INET6:
 		port := binary.BigEndian.Uint16(event.Data[2:4])
 		addr, ok := netip.AddrFromSlice(event.Data[8:24])
@@ -26,10 +27,15 @@ func parseRawAddr(event Event) {
 			log.Println("Invalid address: ", event.Data[8:24])
 		}
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s:%d\n", event.PID, string(event.Comm[:]), addr.String(), port)
+		return addr.String(), port
+
 	case syscall.AF_UNIX:
 		addr := string(bytes.Trim(event.Data[2:], "\x00"))
 		log.Printf("[connnect] pid: %d, comm: %s, addr: %s\n", event.PID, string(event.Comm[:]), addr)
+
+		return addr, 0
 	}
+	return "", 0
 }
 
 func makeFilename(event Event) string {
@@ -46,4 +52,11 @@ func parseAllocEvent(event Event) (AllocEventData, error) {
 	var data AllocEventData
 	err := binary.Read(bytes.NewReader(event.Data[:]), binary.LittleEndian, &data)
 	return data, err
+}
+func cleanString(b [16]byte) string {
+	nullIdx := bytes.Index(b[:], []byte{0})
+	if nullIdx == -1 {
+		return string(b[:])
+	}
+	return string(b[:nullIdx])
 }

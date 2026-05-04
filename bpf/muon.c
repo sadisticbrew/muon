@@ -38,6 +38,7 @@ struct event {
     __u32 pid;
     __u32 type;
     char comm[16];
+
     union {
         char fname[256];
         unsigned char raw_addr[128];
