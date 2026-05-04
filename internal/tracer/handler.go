@@ -3,11 +3,12 @@ package tracer
 import (
 	"fmt"
 	"log"
+	"muon/internal/ebpf"
 
 	"github.com/dustin/go-humanize"
 )
 
-var handlers = map[uint32]func(Event){
+var handlers = map[uint32]func(Event, *ebpf.MuonObjects){
 	0: handleExec,
 	1: handleOpenat,
 	2: handleExit,
@@ -16,26 +17,27 @@ var handlers = map[uint32]func(Event){
 	5: handleBrk,
 }
 
-func handleExec(event Event) {
+func handleExec(event Event, objs *ebpf.MuonObjects) {
 	fname := makeFilename(event)
 	log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 }
 
-func handleOpenat(event Event) {
+func handleOpenat(event Event, objs *ebpf.MuonObjects) {
 	fname := makeFilename(event)
 	log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
 }
 
-func handleExit(event Event) {
+func handleExit(event Event, objs *ebpf.MuonObjects) {
 	log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
+	cleanupAfterExit(objs, event.PID)
 }
 
-func handleConnect(event Event) {
+func handleConnect(event Event, objs *ebpf.MuonObjects) {
 	parseRawAddr(event)
 
 }
 
-func handleMmap(event Event) {
+func handleMmap(event Event, objs *ebpf.MuonObjects) {
 	allocData, err := parseAllocEvent(event)
 	if err != nil {
 		log.Println("Failed to parse alloc_data:", err)
@@ -51,7 +53,7 @@ func handleMmap(event Event) {
 	}
 }
 
-func handleBrk(event Event) {
+func handleBrk(event Event, objs *ebpf.MuonObjects) {
 	brkData, err := parseAllocEvent(event)
 	if err != nil {
 		fmt.Println("Failed to parse brk_data:", err)

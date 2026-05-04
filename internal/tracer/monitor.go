@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 
+	"muon/internal/ebpf"
 	"muon/internal/loader"
 
 	"github.com/cilium/ebpf/ringbuf"
@@ -66,7 +67,7 @@ func Monitor(targetPid uint32) {
 				}
 
 				if handler, ok := handlers[event.Type]; ok {
-					handler(event)
+					handler(event, objs)
 				} else {
 					if event.Type != 1 {
 						fname := makeFilename(event)
@@ -101,5 +102,16 @@ func Monitor(targetPid uint32) {
 		}
 	} else {
 		log.Printf("Failed to read drop counter: %v", err)
+	}
+}
+
+func cleanupAfterExit(objs *ebpf.MuonObjects, pid uint32) {
+	var alloc_key AllocKey
+	var size uint64
+	iter := objs.MuonMaps.ActiveAllocs.Iterate()
+	for iter.Next(&alloc_key, &size) {
+		if alloc_key.PID == pid {
+			objs.MuonMaps.ActiveAllocs.Delete(&alloc_key)
+		}
 	}
 }
