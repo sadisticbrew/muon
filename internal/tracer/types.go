@@ -1,20 +1,16 @@
 package tracer
 
-import (
-	"sync"
-)
-
 const (
 	ALLOC           uint16 = 0
 	FREE            uint16 = 1
 	FREE_NO_HISTORY uint16 = 2
 )
 
-type Event struct {
-	PID  uint32
-	Type uint32
-	Comm [16]byte
-	Data [256]byte
+type EventHeader struct {
+	PID       uint32
+	Type      uint32
+	Timestamp uint64
+	Comm      [16]byte
 }
 
 type AllocEventData struct {
@@ -30,18 +26,22 @@ type AllocKey struct {
 
 type ParsedEvent struct {
 	PID       uint32
-	Comm      string
-	Timestamp int64
-	Kind      string // "mmap", "munmap", "exec", "openat", etc.
-	Detail    string // "addr: 0x7f... size: 4KB" — pre-formatted for display
+	Comm      [16]byte
+	Timestamp uint64
+	Kind      string
+	Detail    [256]byte
+	RawSize   uint64
+	RawAddr   uint64
+	Flag      uint16
+	Count     int64
 }
 
 type MuonState struct {
-	mu           *sync.Mutex
 	ActiveMemory int64
 	PeakMemory   int64
 	TotalAllocd  uint64
 	TotalFreed   uint64
-	RecentEvents []ParsedEvent
+	RecentEvents []*ParsedEvent // TUI gets its own cloned copy
 	DropCount    uint64
+	UspaceDrops  int64
 }

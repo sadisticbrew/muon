@@ -36,7 +36,7 @@ func Load(targetPid uint32) *ebpf.MuonObjects {
 
 	objs.MuonMaps.TrackedPids.Put(&targetPid, &targetPid)
 
-	log.Println("Running program with target_pid set to", targetPid)
+	// log.Println("Running program with target_pid set to", targetPid)
 
 	return &objs
 }

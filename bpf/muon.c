@@ -13,7 +13,6 @@ volatile const __u16 FREE = 1;
 volatile const __u16 FREE_NO_HISTORY = 2;
 
 
-
 struct mmap_temp{
     __u32 pid;
     __u64 size;
@@ -38,7 +37,7 @@ struct event {
     __u32 pid;
     __u32 type;
     char comm[16];
-
+    __u64 timestamp;
     union {
         char fname[256];
         unsigned char raw_addr[128];
@@ -48,7 +47,7 @@ struct event {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24); // 16 MB buffer
+    __uint(max_entries, 1 << 26); // 64 MB buffer
 } events SEC(".maps");
 
 struct {
@@ -68,21 +67,21 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1 << 14);
+    __uint(max_entries, 1 << 20);
     __type(key, __u64);
     __type(value, struct mmap_temp);
 } pending_mmaps SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1 << 14);
+    __uint(max_entries, 1 << 20);
     __type(key, __u64);
     __type(value, struct brk_temp);
 } pending_brks SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1 << 14);
+    __uint(max_entries, 1 << 20);
     __type(key, struct alloc_key);
     __type(value, __u64);
 } active_allocs SEC(".maps");
@@ -197,13 +196,14 @@ int trace_mmap_exit(struct trace_event_raw_sys_exit *ctx){
     alloc_key.pid = pid;
     bpf_map_update_elem(&active_allocs, &alloc_key, &size, BPF_ANY);
 
-    struct event *e;
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    size_t reserve_size = offsetof(struct event, data) + sizeof(struct alloc_event);
+    struct event *e = bpf_ringbuf_reserve(&events, reserve_size, 0);
     if (is_event_empty(e)) return 0;
 
     e->type = 4;
     e->pid = pid;
     bpf_get_current_comm(e->comm, sizeof(e->comm));
+    e->timestamp = bpf_ktime_get_ns();
     e->data.alloc_data.addr = addr;
     e->data.alloc_data.size = size;
     e->data.alloc_data.flag = ALLOC;
@@ -243,14 +243,14 @@ int trace_brk_exit(struct trace_event_raw_sys_exit *ctx) {
     if (new_brk == old_break->old) return 0;
 
 
-
-    struct event *e;
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    size_t reserve_size = offsetof(struct event, data) + sizeof(struct alloc_event);
+    struct event *e = bpf_ringbuf_reserve(&events, reserve_size, 0);
     if (is_event_empty(e)) return 0;
 
     e->pid = pid;
     e->type = 5;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    e->timestamp = bpf_ktime_get_ns();
     if (new_brk > old_break->old) {
         e->data.alloc_data.size = new_brk - old_break->old;
         e->data.alloc_data.flag = ALLOC;
@@ -284,13 +284,14 @@ int trace_munmap(struct trace_event_raw_sys_enter *ctx) {
     /* check if the requested address is active */
     __u64 *active_size = bpf_map_lookup_elem(&active_allocs, &alloc_key);
     if (!active_size) {
-        struct event *e;
-        e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        size_t reserve_size = offsetof(struct event, data) + sizeof(struct alloc_event);
+        struct event *e = bpf_ringbuf_reserve(&events, reserve_size, 0);
         if (is_event_empty(e)) return 0;
 
         e->pid = pid;
         e->type = 4;
         bpf_get_current_comm(&e->comm, sizeof(e->comm));
+        e->timestamp = bpf_ktime_get_ns();
         e->data.alloc_data.addr = addr;
         e->data.alloc_data.size = req_size;
         e->data.alloc_data.flag = FREE_NO_HISTORY;
@@ -312,14 +313,14 @@ int trace_munmap(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
 
-
-    struct event *e;
-    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    size_t reserve_size = offsetof(struct event, data) + sizeof(struct alloc_event);
+    struct event *e = bpf_ringbuf_reserve(&events, reserve_size, 0);
     if (is_event_empty(e)) return 0;
 
     e->pid = pid;
     e->type = 4;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    e->timestamp = bpf_ktime_get_ns();
     e->data.alloc_data.addr = addr;
     e->data.alloc_data.size = freed_size;
     e->data.alloc_data.flag = FREE;

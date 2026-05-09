@@ -174,16 +174,16 @@ run_benchmark() {
 # WORKLOADS
 # =============================================================================
 
-# --- 1. EXEC-heavy ---
-EXEC_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 4 --exec-ops $EXEC_OPS"
-echo ""
-echo "========================================="
-echo " CATEGORY 1: exec-heavy"
-echo "========================================="
-run_benchmark "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$EXEC_WORKLOAD" "exec"
+# # --- 1. EXEC-heavy ---
+# EXEC_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 4 --exec-ops $EXEC_OPS"
+# echo ""
+# echo "========================================="
+# echo " CATEGORY 1: exec-heavy"
+# echo "========================================="
+# run_benchmark "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
+# run_benchmark "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
+# run_benchmark "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
+# run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$EXEC_WORKLOAD" "exec"
 
 # --- 2. OPEN-heavy ---
 OPEN_WORKLOAD="stress-ng --open 4 --open-ops $OPEN_OPS"
@@ -192,8 +192,8 @@ echo "========================================="
 echo " CATEGORY 2: openat-heavy"
 echo "========================================="
 run_benchmark "Baseline" "" "" "$OPEN_WORKLOAD" "open"
-run_benchmark "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
-run_benchmark "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
+# run_benchmark "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
+# run_benchmark "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
 run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$OPEN_WORKLOAD" "open"
 
 # --- 3. MMAP-heavy ---
@@ -203,8 +203,8 @@ echo "========================================="
 echo " CATEGORY 3: mmap-heavy"
 echo "========================================="
 run_benchmark "Baseline" "" "" "$MMAP_WORKLOAD" "mmap"
-run_benchmark "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
-run_benchmark "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
+# run_benchmark "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
+# run_benchmark "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
 run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$MMAP_WORKLOAD" "mmap"
 
 # --- 4. MIXED (Regression) ---
