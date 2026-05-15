@@ -19,8 +19,9 @@ import (
 
 var UserspaceDrops atomic.Int64
 var manager = NewManager()
-var batchChan = make(chan []*ParsedEvent, 50000)
-var cleanupChan = make(chan uint32, 10000)
+var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
+var cleanupChan = make(chan uint32, 10000)        // ~4MB
+var metricChan = make(chan MemFreed, 60)          // ~0.9KB
 var eventPool = sync.Pool{
 	New: func() any {
 		return new(ParsedEvent)
@@ -48,7 +49,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		manager.StartWorker(ctx, batchChan, &eventPool)
+		manager.StartWorker(ctx, batchChan, metricChan, &eventPool)
 	}()
 
 	// drain the incoming events from ringbuff as fast as possible
@@ -56,14 +57,28 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	go func() {
 		defer wg.Done()
 		var header *EventHeader
-		var batch = make([]*ParsedEvent, 0, 1000)
+		var currentBatch ParsedEventBatch = make(ParsedEventBatch, 0, BATCH_SIZE)
 		var payload []byte
-		const minHeaderSize = 32
-
+		var payloadLen int
+		headerSize := int(unsafe.Sizeof(EventHeader{}))
+		var flushTick = time.NewTicker(50 * time.Millisecond)
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-flushTick.C:
+				if len(currentBatch) > 0 {
+					select {
+					case batchChan <- currentBatch:
+					default:
+						for _, e := range currentBatch {
+							*e = ParsedEvent{}
+							eventPool.Put(e)
+						}
+						UserspaceDrops.Add(int64(BATCH_SIZE)) // Log the userspace drop
+					}
+					currentBatch = make(ParsedEventBatch, 0, BATCH_SIZE)
+				}
 			default:
 				record, err := rd.Read()
 				if err != nil {
@@ -79,7 +94,8 @@ func Monitor(targetPid uint32, p *tea.Program) {
 				}
 
 				header = (*EventHeader)(unsafe.Pointer(unsafe.SliceData(record.RawSample)))
-				payload = record.RawSample[28:]
+				payload = record.RawSample[headerSize:]
+				payloadLen = len(payload)
 
 				// Prevent panic if an unknown event type is sent
 				if int(header.Type) >= len(handlers) {
@@ -87,11 +103,11 @@ func Monitor(targetPid uint32, p *tea.Program) {
 				}
 
 				if header.Type == 4 || header.Type == 5 {
-					if len(payload) < 18 { // 18 is size of alloc_event
+					if payloadLen < 18 { // 18 is size of alloc_event
 						log.Println("Skipping malformed alloc event")
 						continue
 					}
-				} else if len(payload) < int(unsafe.Sizeof(EventHeader{})) {
+				} else if payloadLen < headerSize {
 					log.Println("Skipping malformed full event")
 					continue
 				}
@@ -100,18 +116,19 @@ func Monitor(targetPid uint32, p *tea.Program) {
 
 				handler := handlers[header.Type]
 				handler(header, objs, parsedEvent, payload) // Passing slice instead of unsafe pointer
-				batch = append(batch, parsedEvent)
+				currentBatch = append(currentBatch, parsedEvent)
 
-				if len(batch) == 1000 {
+				if len(currentBatch) == BATCH_SIZE {
 					select {
-					case batchChan <- batch:
+					case batchChan <- currentBatch:
 					default:
-						for _, e := range batch {
+						for _, e := range currentBatch {
+							*e = ParsedEvent{}
 							eventPool.Put(e)
 						}
-						UserspaceDrops.Add(1000) // Log the userspace drop
+						UserspaceDrops.Add(int64(BATCH_SIZE)) // Log the userspace drop
 					}
-					batch = make([]*ParsedEvent, 0, 1000)
+					currentBatch = make([]*ParsedEvent, 0, BATCH_SIZE)
 				}
 			}
 		}
@@ -128,6 +145,23 @@ func Monitor(targetPid uint32, p *tea.Program) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var pid uint32
+				var mem uint64
+				var totalMem int64
+
+				iter := objs.MuonMaps.HeapTotals.Iterate()
+				for iter.Next(&pid, &mem) {
+					totalMem += int64(mem)
+				}
+
+				manager.state.activeMemory.Store(totalMem)
+
+				for {
+					peak := manager.state.peakMemory.Load()
+					if totalMem <= peak || manager.state.peakMemory.CompareAndSwap(peak, totalMem) {
+						break
+					}
+				}
 				p.Send(manager.Snapshot())
 			}
 		}
@@ -139,6 +173,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 		defer wg.Done()
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		var memFreed = MemFreed{From: 0}
 		for {
 			select {
 			case <-ctx.Done():
@@ -155,7 +190,8 @@ func Monitor(targetPid uint32, p *tea.Program) {
 					totalDrops += c
 				}
 				if totalDrops > 0 {
-					manager.SetDropCount(totalDrops)
+					memFreed.TotalFreed = totalDrops
+					metricChan <- memFreed
 				}
 			}
 		}

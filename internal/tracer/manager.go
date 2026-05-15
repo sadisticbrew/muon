@@ -34,7 +34,7 @@ func NewManager() *Manager {
 	}
 }
 
-func (m *Manager) StartWorker(ctx context.Context, batches <-chan []*ParsedEvent, pool *sync.Pool) {
+func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan ParsedEventBatch, metricBatch <-chan MemFreed, pool *sync.Pool) {
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -42,11 +42,20 @@ func (m *Manager) StartWorker(ctx context.Context, batches <-chan []*ParsedEvent
 		select {
 		case <-ctx.Done():
 			return
-		case batch := <-batches:
+		case batch := <-parsedEventBatches:
 			for _, event := range batch {
-				m.processEvent(event)
-				*event = ParsedEvent{}
-				pool.Put(event)
+				evicted := m.processEvent(event)
+				if evicted != nil {
+					*evicted = ParsedEvent{}
+					pool.Put(evicted)
+				}
+			}
+		case memFree := <-metricBatch:
+			switch memFree.From {
+			case 0:
+				m.state.dropCount.Store(memFree.TotalFreed)
+			case 1:
+				m.state.totalFreed.Add(memFree.TotalFreed)
 			}
 		case <-ticker.C:
 			snap := &MuonState{
@@ -62,40 +71,24 @@ func (m *Manager) StartWorker(ctx context.Context, batches <-chan []*ParsedEvent
 	}
 }
 
-func (m *Manager) processEvent(event *ParsedEvent) {
+func (m *Manager) processEvent(event *ParsedEvent) *ParsedEvent {
 
-	m.state.recentEvents.Push(event)
+	evicted := m.state.recentEvents.Push(event)
 
 	switch event.Kind {
 	case "mmap":
-		newActive := m.state.activeMemory.Add(int64(event.RawSize))
 		m.state.totalAllocd.Add(event.RawSize)
-
-		for {
-			peak := m.state.peakMemory.Load()
-			if newActive <= peak || m.state.peakMemory.CompareAndSwap(peak, newActive) {
-				break
-			}
-		}
 	case "munmap", "munmap_no_history":
-		m.state.activeMemory.Add(-int64(event.RawSize))
 		m.state.totalFreed.Add(event.RawSize)
 	case "brk":
 		switch event.Flag {
 		case ALLOC:
-			newActive := m.state.activeMemory.Add(int64(event.RawSize))
 			m.state.totalAllocd.Add(event.RawSize)
-			for {
-				peak := m.state.peakMemory.Load()
-				if newActive <= peak || m.state.peakMemory.CompareAndSwap(peak, newActive) {
-					break
-				}
-			}
 		case FREE:
-			m.state.activeMemory.Add(-int64(event.RawSize))
 			m.state.totalFreed.Add(event.RawSize)
 		}
 	}
+	return evicted
 }
 
 func (m *Manager) Snapshot() *MuonState {
@@ -104,11 +97,6 @@ func (m *Manager) Snapshot() *MuonState {
 		return new(MuonState)
 	}
 	return val.(*MuonState)
-}
-
-func (m *Manager) SetDropCount(drops uint64) {
-	currentDrops := m.state.dropCount.Load()
-	m.state.dropCount.CompareAndSwap(currentDrops, drops)
 }
 
 func (m *Manager) CleanUpOnProcessExit(size uint64) {

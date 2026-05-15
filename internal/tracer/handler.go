@@ -89,6 +89,7 @@ func handleBrk(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *Parse
 	parsedEventPtr.Comm = event.Comm
 	parsedEventPtr.Timestamp = event.Timestamp
 	parsedEventPtr.Kind = eventKindMap[event.Type]
+	parsedEventPtr.RawAddr = brkData.Addr
 	parsedEventPtr.RawSize = brkData.Size
 	parsedEventPtr.Flag = brkData.Flag
 }
