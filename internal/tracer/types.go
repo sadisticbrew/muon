@@ -4,7 +4,11 @@ const (
 	ALLOC           uint16 = 0
 	FREE            uint16 = 1
 	FREE_NO_HISTORY uint16 = 2
+	BATCH_SIZE      int    = 1024
+	minHeaderSize   int    = 32
 )
+
+type ParsedEventBatch []*ParsedEvent
 
 type EventHeader struct {
 	PID       uint32
@@ -24,6 +28,11 @@ type AllocKey struct {
 	PID  uint32
 }
 
+type MemFreed struct {
+	From       int
+	TotalFreed uint64
+}
+
 type ParsedEvent struct {
 	PID       uint32
 	Comm      [16]byte
@@ -41,7 +50,7 @@ type MuonState struct {
 	PeakMemory   int64
 	TotalAllocd  uint64
 	TotalFreed   uint64
-	RecentEvents []*ParsedEvent // TUI gets its own cloned copy
+	RecentEvents []ParsedEvent // TUI gets its own cloned copy
 	DropCount    uint64
 	UspaceDrops  int64
 }

@@ -1,9 +1,12 @@
 package tracer
 
+import "sync"
+
 type RingBuff struct {
 	data  []*ParsedEvent
 	size  int
 	write int
+	mu    sync.RWMutex
 }
 
 func NewRingBuff(size int) *RingBuff {
@@ -14,55 +17,52 @@ func NewRingBuff(size int) *RingBuff {
 	}
 }
 
-func (r *RingBuff) Push(event *ParsedEvent) {
+func (r *RingBuff) Push(event *ParsedEvent) *ParsedEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.write == -1 {
 		r.write = 0
 		r.data[r.write] = event
-		return
+		return nil
 	}
 
 	lastEvent := r.data[r.write]
-
 	if lastEvent.cmpParsedEvent(event) {
-		r.data[r.write].Count += 1
-		return
+		lastEvent.Count += 1
+		return event
 	}
 	r.write = (r.write + 1) % r.size
+	evicted := r.data[r.write]
 	r.data[r.write] = event
+
+	return evicted
 }
 
-func (r *RingBuff) Emit(n int) []*ParsedEvent {
-	var result []*ParsedEvent
+func (r *RingBuff) Emit(n int) []ParsedEvent {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	if r.write == -1 {
-		return result
+		return nil
 	}
 	if n > r.size {
 		n = r.size
 	}
+
+	result := make([]ParsedEvent, 0, n)
+
 	for i := 0; i < n; i++ {
 		index := r.write - i
 		if index < 0 {
 			index += r.size
 		}
-		result = append(result, r.data[index])
+		if r.data[index] == nil {
+			break
+		}
+
+		result = append(result, *r.data[index])
 	}
 
 	return result
-}
-
-func (r *RingBuff) Fill(dest []*ParsedEvent) int {
-	if r.write == -1 {
-		return 0
-	}
-	count := 0
-	for i := 0; i < len(dest); i++ {
-		index := r.write - i
-		if index < 0 {
-			index += r.size
-		}
-		dest[i] = r.data[index]
-		count++
-	}
-	return count
 }

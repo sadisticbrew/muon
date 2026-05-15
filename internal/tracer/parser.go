@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-func ParseRawAddr(event *ParsedEvent) (string, uint16) {
+func ParseRawAddr(event ParsedEvent) (string, uint16) {
 	family := binary.NativeEndian.Uint16(event.Detail[0:2])
 	switch family {
 	case syscall.AF_INET:
@@ -44,7 +44,7 @@ func getNullIdx(b [256]byte) int {
 	}
 	return 255
 }
-func MakeFilename(event *ParsedEvent) string {
+func MakeFilename(event ParsedEvent) string {
 	nullIdx := bytes.Index(event.Detail[:], []byte{0})
 	var fname string
 	if nullIdx == -1 {
@@ -73,6 +73,12 @@ func (e *ParsedEvent) cmpParsedEvent(other *ParsedEvent) bool {
 		return false
 	}
 	if e.RawSize != other.RawSize {
+		return false
+	}
+	if e.RawAddr != other.RawAddr {
+		return false
+	}
+	if e.Detail != other.Detail {
 		return false
 	}
 	if e.Flag != other.Flag {
