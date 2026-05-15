@@ -4,7 +4,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
+
 #include "maps.c"
+
 char __license[] SEC("license") = "Dual MIT/GPL";
 
 // Injected at load time from userspace via BPF skeleton. Not used for filtering
@@ -326,6 +328,7 @@ int trace_munmap(struct trace_event_raw_sys_enter *ctx) {
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
+
 
 // Automatically extend tracking to child processes so that forked children
 // are observed without requiring userspace to manually insert their PIDs.

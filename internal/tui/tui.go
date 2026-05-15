@@ -68,7 +68,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.viewport.Width = m.width - 4
-		m.viewport.Height = m.height - 14
+		vpHeight := m.height - 14
+		m.viewport.Height = max(vpHeight, 0)
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -140,7 +141,7 @@ func StartTUI(targetPid uint32) error {
 	return err
 }
 
-func (m *Model) updateLog(events []*tracer.ParsedEvent) {
+func (m *Model) updateLog(events []tracer.ParsedEvent) {
 	if len(events) == 0 {
 		return
 	}
@@ -149,7 +150,7 @@ func (m *Model) updateLog(events []*tracer.ParsedEvent) {
 	// We need to find the oldest *unseen* event so we can process chronologically.
 	oldestNewIdx := -1
 	for i := 0; i < len(events); i++ {
-		if events[i] == nil || events[i].Timestamp <= m.lastTimestamp {
+		if events[i].Timestamp <= m.lastTimestamp {
 			break
 		}
 		oldestNewIdx = i
@@ -184,27 +185,29 @@ func (m *Model) updateLog(events []*tracer.ParsedEvent) {
 		// Re-slice to the max size
 		m.eventLog = m.eventLog[:maxLogSize]
 	}
-
+	isBottom := m.viewport.AtBottom()
 	m.viewport.SetContent(strings.Join(m.eventLog, "\n"))
-	m.viewport.GotoBottom()
+	if isBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
-func formatEvent(e *tracer.ParsedEvent) string {
+func formatEvent(e tracer.ParsedEvent) string {
 	comm := tracer.CleanString(e.Comm)
 	ts := e.Timestamp
 
 	switch e.Kind {
 	case "openat":
-		return fmt.Sprintf("%d | PID: %5d | [openat]  | Comm: %-10s | Path: %s", ts, e.PID, comm, tracer.MakeFilename(e))
-	case "mmap", "munmap", "brk":
-		return fmt.Sprintf("%d | PID: %5d | [%-7s] | Comm: %-10s | Addr: %x | Size: %s",
-			ts, e.PID, e.Kind, comm, e.RawAddr, humanize.Bytes(uint64(e.RawSize)))
+		return fmt.Sprintf("%d | PID: %5d | [openat]  | Comm: %s | Path: %s (x%d)", ts, e.PID, comm, tracer.MakeFilename(e), e.Count)
+	case "mmap", "munmap", "brk", "munmap_no_history":
+		return fmt.Sprintf("%d | PID: %5d | [%s] | Comm: %s | Addr: %x | Size: %s (x%d)",
+			ts, e.PID, e.Kind, comm, e.RawAddr, humanize.Bytes(uint64(e.RawSize)), e.Count)
 	case "connect":
 		addr, port := tracer.ParseRawAddr(e)
-		return fmt.Sprintf("%d | PID: %5d | [connect] | Comm: %-10s | Addr: %s:%d", ts, e.PID, comm, addr, port)
+		return fmt.Sprintf("%d | PID: %5d | [connect] | Comm: %s | Addr: %s:%d (x%d)", ts, e.PID, comm, addr, port, e.Count)
 	case "exit":
-		return fmt.Sprintf("%d | PID: %5d | [exit]    | Comm: %-10s", ts, e.PID, comm)
+		return fmt.Sprintf("%d | PID: %5d | [exit]    | Comm: %s (x%d)", ts, e.PID, comm, e.Count)
 	default:
-		return fmt.Sprintf("%d | PID: %5d | [unknown] | Comm: %-10s", ts, e.PID, comm)
+		return fmt.Sprintf("%d | PID: %5d | [unknown] | Comm: %s (x%d)", ts, e.PID, comm, e.Count)
 	}
 }
