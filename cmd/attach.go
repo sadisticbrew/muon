@@ -3,7 +3,9 @@ package cmd
 import (
 	"errors"
 	"muon/internal/tracer"
+	"muon/internal/tui"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 )
 
@@ -16,8 +18,18 @@ var attachCmd = &cobra.Command{
 		if targetPid == 0 {
 			return errors.New("Target pid is required")
 		}
-		// Pass the PID to the engine and let it take over
-		tracer.Monitor(targetPid)
+		p := tea.NewProgram(
+			tui.New(targetPid),
+			tea.WithAltScreen(), // Uses the alternate screen buffer (like vim/htop)
+			tea.WithMouseCellMotion(),
+		)
+
+		go tracer.Monitor(targetPid, p)
+
+		_, err := p.Run()
+		if err != nil {
+			return err
+		}
 		return nil
 	},
 }

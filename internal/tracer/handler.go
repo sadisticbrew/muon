@@ -1,61 +1,90 @@
 package tracer
 
 import (
-	"fmt"
-	"log"
-
-	"github.com/dustin/go-humanize"
+	"muon/internal/ebpf"
+	"unsafe"
 )
 
-var handlers = map[uint32]func(Event){
-	0: handleExec,
-	1: handleOpenat,
-	2: handleExit,
-	3: handleConnect,
-	4: handleMmap,
-	5: handleBrk,
+// Changed payload to []byte to read it safely
+var handlers = []func(*EventHeader, *ebpf.MuonObjects, *ParsedEvent, []byte){
+	handleExec,
+	handleOpenat,
+	handleExit,
+	handleConnect,
+	handleMmap,
+	handleBrk,
 }
 
-func handleExec(event Event) {
-	fname := makeFilename(event)
-	log.Printf("[exec] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+var eventKindMap = []string{
+	"exec",
+	"openat",
+	"exit",
+	"connect",
+	"mmap",
+	"brk",
 }
 
-func handleOpenat(event Event) {
-	fname := makeFilename(event)
-	log.Printf("[openat] pid: %d, comm: %s, filename: %s\n", event.PID, string(event.Comm[:]), fname)
+func handleExec(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.Kind = eventKindMap[event.Type]
+	copy(parsedEventPtr.Detail[:], payload)
 }
 
-func handleExit(event Event) {
-	log.Printf("[exit] pid: %d, comm: %s\n", event.PID, string(event.Comm[:]))
+func handleOpenat(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.Kind = eventKindMap[event.Type]
+	copy(parsedEventPtr.Detail[:], payload)
 }
 
-func handleConnect(event Event) {
-	parseRawAddr(event)
-
+func handleExit(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.Kind = eventKindMap[event.Type]
+	copy(parsedEventPtr.Detail[:], payload)
 }
 
-func handleMmap(event Event) {
-	allocData, err := parseAllocEvent(event)
-	if err != nil {
-		log.Println("Failed to parse alloc_data:", err)
-		return
-	}
+func handleConnect(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.Kind = eventKindMap[event.Type]
+	copy(parsedEventPtr.Detail[:], payload)
+}
+
+func handleMmap(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	// Safe to extract because we ensure length > 18 in monitor.go
+	allocData := *(*AllocEventData)(unsafe.Pointer(unsafe.SliceData(payload)))
+
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.RawSize = allocData.Size
+	parsedEventPtr.RawAddr = allocData.Addr
+	parsedEventPtr.Flag = allocData.Flag
+
 	switch allocData.Flag {
 	case ALLOC:
-		log.Printf("[mmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+		parsedEventPtr.Kind = "mmap"
 	case FREE:
-		log.Printf("[munmap] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+		parsedEventPtr.Kind = "munmap"
 	case FREE_NO_HISTORY:
-		log.Printf("[munmap_no_history] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(allocData.Size), allocData.Addr)
+		parsedEventPtr.Kind = "munmap_no_history"
+		parsedEventPtr.RawAddr = allocData.Addr
 	}
 }
 
-func handleBrk(event Event) {
-	brkData, err := parseAllocEvent(event)
-	if err != nil {
-		fmt.Println("Failed to parse brk_data:", err)
-		return
-	}
-	log.Printf("[brk] - pid: %d, comm: %s, size: %s, addr: %x\n", event.PID, string(event.Comm[:]), humanize.Bytes(brkData.Size), brkData.Addr)
+func handleBrk(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
+	brkData := *(*AllocEventData)(unsafe.Pointer(unsafe.SliceData(payload)))
+	parsedEventPtr.PID = event.PID
+	parsedEventPtr.Comm = event.Comm
+	parsedEventPtr.Timestamp = event.Timestamp
+	parsedEventPtr.Kind = eventKindMap[event.Type]
+	parsedEventPtr.RawAddr = brkData.Addr
+	parsedEventPtr.RawSize = brkData.Size
+	parsedEventPtr.Flag = brkData.Flag
 }
