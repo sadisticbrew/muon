@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -20,7 +21,6 @@ import (
 var UserspaceDrops atomic.Int64
 var manager = NewManager()
 var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
-var cleanupChan = make(chan uint32, 10000)        // ~4MB
 var metricChan = make(chan MemFreed, 60)          // ~0.9KB
 var eventPool = sync.Pool{
 	New: func() any {
@@ -197,28 +197,34 @@ func Monitor(targetPid uint32, p *tea.Program) {
 		}
 	}()
 
-	// clean up exited processes
+	// janitor go routine
 	wg.Add(1)
 	go func() {
+		var allocKey AllocKey
+		var size uint64
+		var pid uint64
+
 		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case pid := <-cleanupChan:
-				var allocKey AllocKey
-				var size uint64
-				var totalFreed uint64
-				iter := objs.MuonMaps.ActiveAllocs.Iterate()
-				for iter.Next(&allocKey, &size) {
-					if allocKey.PID == pid {
-						totalFreed += size
-						objs.MuonMaps.ActiveAllocs.Delete(&allocKey)
-					}
+		ticker := time.NewTicker(30 * time.Second)
+
+		for range ticker.C {
+			for iter := objs.MuonMaps.ActiveAllocs.Iterate(); iter.Next(&allocKey, &size); {
+				if _, err := os.Stat(fmt.Sprintf("/proc/%d", allocKey.PID)); os.IsNotExist(err) {
+					objs.MuonMaps.ActiveAllocs.Delete(&allocKey)
 				}
-				manager.CleanUpOnProcessExit(totalFreed)
+			}
+			for iter := objs.MuonMaps.PendingMmaps.Iterate(); iter.Next(&pid, &size); {
+				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+					objs.MuonMaps.PendingMmaps.Delete(&pid)
+				}
+			}
+			for iter := objs.MuonMaps.PendingBrks.Iterate(); iter.Next(&pid, &size); {
+				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+					objs.MuonMaps.PendingBrks.Delete(&pid)
+				}
 			}
 		}
+
 	}()
 
 	<-ctx.Done()

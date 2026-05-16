@@ -41,11 +41,6 @@ func handleOpenat(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *Pa
 }
 
 func handleExit(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
-	// Make send non-blocking to prevent locking up the fast ring buffer loop
-	select {
-	case cleanupChan <- event.PID:
-	default:
-	}
 	parsedEventPtr.PID = event.PID
 	parsedEventPtr.Comm = event.Comm
 	parsedEventPtr.Timestamp = event.Timestamp
