@@ -1,12 +1,12 @@
 // go:build ignore
 
+
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
 #include "maps.c"
-#include "memory.h"
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -16,9 +16,10 @@ volatile const __u32 target_pid;
 
 // Flags carried in alloc_event.flag to let userspace know the nature of each event
 // without needing to diff maps on the userspace side.
+
 #define ALLOC           0
 #define FREE            1
-#define FREE_NO_HISTORY 2  // munmap on an addr we never saw mmap'd (e.g. pre-attach allocations)
+#define FREE_NO_HISTORY 2 // munmap on an addr we never saw mmap'd (e.g. pre-attach allocations)
 
 // ---------- Helper funcs --------------
 
@@ -36,6 +37,8 @@ int is_event_empty(struct event *e) {
         return 1;}
     return 0;
 }
+
+#include "memory.h"
 
 // ---------------------------------------
 
