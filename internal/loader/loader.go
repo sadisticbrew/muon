@@ -25,13 +25,13 @@ func Load(targetPid uint32) *ebpf.MuonObjects {
 
 	var objs ebpf.MuonObjects
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		// log.Fatalf("Failed to load objects: %v", err)
 		var ve *gebpf.VerifierError
 		if errors.As(err, &ve) {
 			fmt.Printf("Detailed Verifier Error:\n%+v\n", ve)
 		} else {
 			fmt.Printf("Load failed: %v\n", err)
 		}
+		log.Fatalf("Failed to load muon: %v", err)
 	}
 
 	objs.MuonMaps.TrackedPids.Put(&targetPid, &targetPid)

@@ -207,20 +207,25 @@ func Monitor(targetPid uint32, p *tea.Program) {
 		defer wg.Done()
 		ticker := time.NewTicker(30 * time.Second)
 
-		for range ticker.C {
-			for iter := objs.MuonMaps.ActiveAllocs.Iterate(); iter.Next(&allocKey, &size); {
-				if _, err := os.Stat(fmt.Sprintf("/proc/%d", allocKey.PID)); os.IsNotExist(err) {
-					objs.MuonMaps.ActiveAllocs.Delete(&allocKey)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for iter := objs.MuonMaps.ActiveAllocs.Iterate(); iter.Next(&allocKey, &size); {
+					if _, err := os.Stat(fmt.Sprintf("/proc/%d", allocKey.PID)); os.IsNotExist(err) {
+						objs.MuonMaps.ActiveAllocs.Delete(&allocKey)
+					}
 				}
-			}
-			for iter := objs.MuonMaps.PendingMmaps.Iterate(); iter.Next(&pid, &size); {
-				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
-					objs.MuonMaps.PendingMmaps.Delete(&pid)
+				for iter := objs.MuonMaps.PendingMmaps.Iterate(); iter.Next(&pid, &size); {
+					if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+						objs.MuonMaps.PendingMmaps.Delete(&pid)
+					}
 				}
-			}
-			for iter := objs.MuonMaps.PendingBrks.Iterate(); iter.Next(&pid, &size); {
-				if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
-					objs.MuonMaps.PendingBrks.Delete(&pid)
+				for iter := objs.MuonMaps.PendingBrks.Iterate(); iter.Next(&pid, &size); {
+					if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+						objs.MuonMaps.PendingBrks.Delete(&pid)
+					}
 				}
 			}
 		}
