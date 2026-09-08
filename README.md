@@ -75,7 +75,7 @@ C in the kernel, Go in userspace.
 
 - Kernel probes are written in C against `vmlinux.h` for CO-RE support -- compile once, run across kernel versions.
 - Userspace is Go, loading the probes with `cilium/ebpf` and draining events.
-- The two talk over a 16MB BPF ring buffer, so high-frequency bursts don't drop events.
+- The two talk over a 64MB BPF ring buffer, so high-frequency bursts don't drop events.
 
 ## Build
 
@@ -83,7 +83,7 @@ You need:
 
 - Linux 5.8+ (ring buffer support)
 - `clang`, `llvm` and `bpftool`
-- Go 1.21+
+- Go 1.24+
 
 ```bash
 make vmlinux   # generate kernel headers
