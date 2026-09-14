@@ -16,3 +16,7 @@ clean.py
 comparison.diff
 session_log.txt
 cleaned_log.txt
+
+#misc
+crash.txt
+trace.out
