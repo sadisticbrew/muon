@@ -102,14 +102,27 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
 
 // Automatically extend tracking to child processes so that forked children
 // are observed without requiring userspace to manually insert their PIDs.
-SEC("tracepoint/sched/sched_process_fork")
-int trace_forkAndClone(struct trace_event_raw_sched_process_fork *ctx) {
-    __u32 pid = ctx->child_pid;
-    __u32 ppid = bpf_get_current_pid_tgid() >> 32;
-    if (!bpf_map_lookup_elem(&tracked_pids, &ppid)) return 0;
+SEC("raw_tp/sched_process_fork")
+int trace_forkAndClone(struct bpf_raw_tracepoint_args *ctx) {
+    struct task_struct *child = (struct task_struct *)ctx->args[1];
 
-    bpf_map_update_elem(&tracked_pids, &pid, &pid, BPF_ANY);
+    // if the parent is not tracked, skip this fork
+    __u32 parent_tgid = bpf_get_current_pid_tgid() >> 32;
+    if (!bpf_map_lookup_elem(&tracked_pids, &parent_tgid)) return 0;
 
+    __u32 child_tgid = BPF_CORE_READ(child, tgid);
+    __u32 child_tid = BPF_CORE_READ(child, pid);
+    if (child_tgid != child_tid) return 0; // its a thread, not a process
+
+    int ret =  bpf_map_update_elem(&tracked_pids, &child_tgid, &child_tid, BPF_ANY);
+    if (ret != 0 ) {
+        __u32 key = 0;
+        __u64 *count = bpf_map_lookup_elem(&drop_counter, &key);
+        if (count) {
+            *count += 1;
+        }
+        return 1;
+    }
     return 0;
 }
 
