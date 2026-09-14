@@ -10,6 +10,7 @@ import (
 )
 
 var targetPid uint32
+var deepTrace bool = false
 
 var attachCmd = &cobra.Command{
 	Use:   "attach",
@@ -23,7 +24,9 @@ var attachCmd = &cobra.Command{
 			tea.WithAltScreen(), // Uses the alternate screen buffer (like vim/htop)
 			tea.WithMouseCellMotion(),
 		)
-
+		if deepTrace {
+			return errors.New("--allocations (deep trace) is not implemented yet")
+		}
 		go tracer.Monitor(targetPid, p)
 
 		_, err := p.Run()
@@ -38,4 +41,5 @@ func init() {
 	rootCmd.AddCommand(attachCmd)
 	attachCmd.Flags().Uint32VarP(&targetPid, "target_pid", "p", 0, "target process id")
 	attachCmd.MarkFlagRequired("target_pid")
+	attachCmd.Flags().BoolVar(&deepTrace, "allocations", false, "Enable deep trace mode")
 }
