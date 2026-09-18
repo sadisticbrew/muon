@@ -56,6 +56,8 @@ func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan Par
 				m.state.dropCount.Store(memFree.TotalFreed)
 			case 1:
 				m.state.totalFreed.Add(memFree.TotalFreed)
+			case 2:
+				m.state.uspaceDrops.Add(int64(memFree.TotalFreed))
 			}
 		case <-ticker.C:
 			snap := &MuonState{

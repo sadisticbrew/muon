@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -18,7 +17,6 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
-var UserspaceDrops atomic.Int64
 var manager = NewManager()
 var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
 var metricChan = make(chan MemFreed, 60)          // ~0.9KB
@@ -75,7 +73,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							*e = ParsedEvent{}
 							eventPool.Put(e)
 						}
-						UserspaceDrops.Add(int64(BATCH_SIZE)) // Log the userspace drop
+						metricChan <- MemFreed{From: 2, TotalFreed: uint64(len(currentBatch))}
 					}
 					currentBatch = make(ParsedEventBatch, 0, BATCH_SIZE)
 				}
@@ -126,7 +124,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							*e = ParsedEvent{}
 							eventPool.Put(e)
 						}
-						UserspaceDrops.Add(int64(BATCH_SIZE)) // Log the userspace drop
+						metricChan <- MemFreed{From: 2, TotalFreed: uint64(len(currentBatch))} // Log the userspace drop
 					}
 					currentBatch = make([]*ParsedEvent, 0, BATCH_SIZE)
 				}
