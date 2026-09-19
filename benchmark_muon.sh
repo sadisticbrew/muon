@@ -122,6 +122,26 @@ run_benchmark() {
 
     sleep 1
 
+    local muon_ready=1
+    if [ -n "$muon_pid" ]; then
+      if ! kill -0 "$muon_pid" 2>/dev/null; then
+        echo "  Run $i: FATAL — Muon exited before the run started:"
+        tail -n 10 "$muon_log" | sed 's/^/    /'
+        muon_ready=0
+      elif ! grep -q "Muon ready" "$muon_log" 2>/dev/null; then
+        echo "  Run $i: FATAL — Muon never reported ready:"
+        tail -n 10 "$muon_log" | sed 's/^/    /'
+        muon_ready=0
+      fi
+      if [ "$muon_ready" -eq 0 ]; then
+        kill "$muon_pid" 2>/dev/null
+        wait "$muon_pid" 2>/dev/null
+        rm -f "$muon_log"
+        ((dropped_runs++))
+        continue
+      fi
+    fi
+
     local time_output
     if [ -n "$prefix_cmd" ]; then
       time_output=$( { /usr/bin/time -f "%e" \

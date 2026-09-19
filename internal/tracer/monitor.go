@@ -41,6 +41,8 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	}
 	defer rd.Close()
 
+	log.Printf("Muon ready: tracing PID %d, %d probes attached", targetPid, len(links))
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
