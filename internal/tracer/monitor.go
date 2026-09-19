@@ -164,7 +164,9 @@ func Monitor(targetPid uint32, p *tea.Program) {
 						break
 					}
 				}
-				p.Send(manager.Snapshot())
+				if p != nil {
+					p.Send(manager.Snapshot())
+				}
 			}
 		}
 	}()

@@ -231,7 +231,7 @@ echo "========================================="
 maybe_run "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
 maybe_run "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
 maybe_run "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$EXEC_WORKLOAD" "exec"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$EXEC_WORKLOAD" "exec"
 
 # --- 2. OPEN-heavy ---
 OPEN_WORKLOAD="stress-ng --open 4 --open-ops $OPEN_OPS"
@@ -242,7 +242,7 @@ echo "========================================="
 maybe_run "Baseline" "" "" "$OPEN_WORKLOAD" "open"
 # run_benchmark "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
 # run_benchmark "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$OPEN_WORKLOAD" "open"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$OPEN_WORKLOAD" "open"
 
 # --- 3. MMAP-heavy ---
 MMAP_WORKLOAD="stress-ng --mmap 4 --mmap-mprotect --mmap-bytes 4K --mmap-ops $MMAP_OPS"
@@ -253,7 +253,7 @@ echo "========================================="
 maybe_run "Baseline" "" "" "$MMAP_WORKLOAD" "mmap"
 maybe_run "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
 maybe_run "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$MMAP_WORKLOAD" "mmap"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$MMAP_WORKLOAD" "mmap"
 
 # --- 4. MIXED (Regression) ---
 # MIXED_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 2 --exec-ops $MIXED_EXEC_OPS --mmap 2 --mmap-mprotect --mmap-ops $MIXED_MMAP_OPS --open 2 --open-ops $MIXED_OPEN_OPS"
@@ -264,7 +264,7 @@ maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$MMAP_WORKLOAD" "mmap"
 # run_benchmark "Baseline" "" "" "$MIXED_WORKLOAD" "mixed"
 # run_benchmark "strace" "strace -f -e trace=execve,exit,openat,mmap,brk -o /dev/null" "" "$MIXED_WORKLOAD" "mixed"
 # run_benchmark "perf trace" "perf trace -e execve,exit,openat,mmap,brk -o /dev/null --" "" "$MIXED_WORKLOAD" "mixed"
-# run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$MIXED_WORKLOAD" "mixed"
+# run_benchmark "Muon" "" "$MUON_BIN attach -p $$ --headless" "$MIXED_WORKLOAD" "mixed"
 
 # =============================================================================
 # SUMMARY

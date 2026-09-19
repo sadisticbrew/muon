@@ -11,6 +11,7 @@ import (
 
 var targetPid uint32
 var deepTrace bool = false
+var headless bool = false
 
 var attachCmd = &cobra.Command{
 	Use:   "attach",
@@ -19,14 +20,18 @@ var attachCmd = &cobra.Command{
 		if targetPid == 0 {
 			return errors.New("Target pid is required")
 		}
+		if deepTrace {
+			return errors.New("--allocations (deep trace) is not implemented yet")
+		}
+		if headless {
+			tracer.Monitor(targetPid, nil)
+			return nil
+		}
 		p := tea.NewProgram(
 			tui.New(targetPid),
 			tea.WithAltScreen(), // Uses the alternate screen buffer (like vim/htop)
 			tea.WithMouseCellMotion(),
 		)
-		if deepTrace {
-			return errors.New("--allocations (deep trace) is not implemented yet")
-		}
 		go tracer.Monitor(targetPid, p)
 
 		_, err := p.Run()
@@ -42,4 +47,5 @@ func init() {
 	attachCmd.Flags().Uint32VarP(&targetPid, "target_pid", "p", 0, "target process id")
 	attachCmd.MarkFlagRequired("target_pid")
 	attachCmd.Flags().BoolVar(&deepTrace, "allocations", false, "Enable deep trace mode")
+	attachCmd.Flags().BoolVar(&headless, "headless", false, "Run without the terminal UI (for benchmarking)")
 }
