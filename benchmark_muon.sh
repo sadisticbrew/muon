@@ -18,7 +18,20 @@ WORKLOAD_CORES="4,5,6,7"
 MUON_CORE="0"
 
 # Dev mode vs Full mode
-if [[ "$1" == "--fast" ]]; then
+FAST_MODE=0
+MUON_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --fast) FAST_MODE=1 ;;
+    --muon-only) MUON_ONLY=1 ;;
+    *)
+      echo "Unknown option: $arg (supported: --fast, --muon-only)"
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$FAST_MODE" -eq 1 ]]; then
     ITERATIONS=5
     EXEC_OPS=1000
     OPEN_OPS=100000
@@ -45,6 +58,12 @@ else
     echo "============================================="
     echo " Muon Benchmark Suite [FULL MODE]"
     echo "============================================="
+fi
+
+# Muon-only mode keeps its own results file so it never clobbers a full run.
+if [[ "$MUON_ONLY" -eq 1 ]]; then
+  RESULTS_FILE="/tmp/muon_bench_muon_only.txt"
+  echo " MUON ONLY — baseline/strace/perf trace skipped, no overhead% in summary"
 fi
 
 > "$RESULTS_FILE"
@@ -95,6 +114,15 @@ calculate_stats() {
 # =============================================================================
 # CORE BENCHMARK FUNCTION
 # =============================================================================
+
+# Wrapper: in muon-only mode, skip every tracer whose name isn't "Muon".
+maybe_run() {
+  if [[ "$MUON_ONLY" -eq 1 && "$1" != "Muon" ]]; then
+    echo "  [muon-only] skipping $1"
+    return 0
+  fi
+  run_benchmark "$@"
+}
 
 run_benchmark() {
   local name="$1"
@@ -200,10 +228,10 @@ echo ""
 echo "========================================="
 echo " CATEGORY 1: exec-heavy"
 echo "========================================="
-run_benchmark "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
-run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$EXEC_WORKLOAD" "exec"
+maybe_run "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
+maybe_run "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
+maybe_run "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$EXEC_WORKLOAD" "exec"
 
 # --- 2. OPEN-heavy ---
 OPEN_WORKLOAD="stress-ng --open 4 --open-ops $OPEN_OPS"
@@ -211,10 +239,10 @@ echo ""
 echo "========================================="
 echo " CATEGORY 2: openat-heavy"
 echo "========================================="
-run_benchmark "Baseline" "" "" "$OPEN_WORKLOAD" "open"
+maybe_run "Baseline" "" "" "$OPEN_WORKLOAD" "open"
 # run_benchmark "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
 # run_benchmark "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
-run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$OPEN_WORKLOAD" "open"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$OPEN_WORKLOAD" "open"
 
 # --- 3. MMAP-heavy ---
 MMAP_WORKLOAD="stress-ng --mmap 4 --mmap-mprotect --mmap-bytes 4K --mmap-ops $MMAP_OPS"
@@ -222,10 +250,10 @@ echo ""
 echo "========================================="
 echo " CATEGORY 3: mmap-heavy"
 echo "========================================="
-run_benchmark "Baseline" "" "" "$MMAP_WORKLOAD" "mmap"
-run_benchmark "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
-run_benchmark "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
-run_benchmark "Muon" "" "$MUON_BIN attach -p $$" "$MMAP_WORKLOAD" "mmap"
+maybe_run "Baseline" "" "" "$MMAP_WORKLOAD" "mmap"
+maybe_run "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
+maybe_run "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
+maybe_run "Muon" "" "$MUON_BIN attach -p $$" "$MMAP_WORKLOAD" "mmap"
 
 # --- 4. MIXED (Regression) ---
 # MIXED_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 2 --exec-ops $MIXED_EXEC_OPS --mmap 2 --mmap-mprotect --mmap-ops $MIXED_MMAP_OPS --open 2 --open-ops $MIXED_OPEN_OPS"
@@ -255,6 +283,11 @@ while IFS=',' read -r category name avg stddev valid dropped; do
 done < "$RESULTS_FILE"
 
 echo ""
-echo "Overhead calculation:"
-echo "  overhead% = ((tracer_avg - baseline_avg) / baseline_avg) * 100"
+if [[ "$MUON_ONLY" -eq 1 ]]; then
+  echo "Muon-only mode: no baseline in this session."
+  echo "overhead% needs a full run: sudo ./benchmark_muon.sh [--fast]"
+else
+  echo "Overhead calculation:"
+  echo "  overhead% = ((tracer_avg - baseline_avg) / baseline_avg) * 100"
+fi
 echo ""
