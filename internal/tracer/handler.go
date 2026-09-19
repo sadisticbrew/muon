@@ -57,7 +57,7 @@ func handleConnect(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *P
 }
 
 func handleMmap(event *EventHeader, objs *ebpf.MuonObjects, parsedEventPtr *ParsedEvent, payload []byte) {
-	// Safe to extract because we ensure length > 18 in monitor.go
+	// Safe to extract because we ensure length >= 24 in monitor.go
 	allocData := *(*AllocEventData)(unsafe.Pointer(unsafe.SliceData(payload)))
 
 	parsedEventPtr.PID = event.PID

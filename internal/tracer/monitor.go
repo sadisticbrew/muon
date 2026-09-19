@@ -17,6 +17,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
+const allocEventSize = int(unsafe.Sizeof(AllocEventData{}))
+
 var manager = NewManager()
 var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
 var metricChan = make(chan MemFreed, 60)          // ~0.9KB
@@ -101,7 +103,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 				}
 
 				if header.Type == 4 || header.Type == 5 {
-					if payloadLen < 18 { // 18 is size of alloc_event
+					if payloadLen < allocEventSize {
 						log.Println("Skipping malformed alloc event")
 						continue
 					}
