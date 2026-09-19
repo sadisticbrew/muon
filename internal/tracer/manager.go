@@ -34,7 +34,7 @@ func NewManager() *Manager {
 	}
 }
 
-func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan ParsedEventBatch, metricBatch <-chan MemFreed, pool *sync.Pool) {
+func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan ParsedEventBatch, pool *sync.Pool) {
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -50,15 +50,6 @@ func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan Par
 					pool.Put(evicted)
 				}
 			}
-		case memFree := <-metricBatch:
-			switch memFree.From {
-			case 0:
-				m.state.dropCount.Store(memFree.TotalFreed)
-			case 1:
-				m.state.totalFreed.Add(memFree.TotalFreed)
-			case 2:
-				m.state.uspaceDrops.Add(int64(memFree.TotalFreed))
-			}
 		case <-ticker.C:
 			snap := &MuonState{
 				ActiveMemory: m.state.activeMemory.Load(),
@@ -71,6 +62,14 @@ func (m *Manager) StartWorker(ctx context.Context, parsedEventBatches <-chan Par
 			m.uiState.Store(snap)
 		}
 	}
+}
+
+func (m *Manager) ReportUserspaceDrops(n uint64) {
+	m.state.uspaceDrops.Add(int64(n))
+}
+
+func (m *Manager) ReportKernelDrops(n uint64) {
+	m.state.dropCount.Store(n)
 }
 
 func (m *Manager) processEvent(event *ParsedEvent) *ParsedEvent {

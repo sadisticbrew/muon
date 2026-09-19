@@ -21,7 +21,6 @@ const allocEventSize = int(unsafe.Sizeof(AllocEventData{}))
 
 var manager = NewManager()
 var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
-var metricChan = make(chan MemFreed, 60)          // ~0.9KB
 var eventPool = sync.Pool{
 	New: func() any {
 		return new(ParsedEvent)
@@ -51,7 +50,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		manager.StartWorker(ctx, batchChan, metricChan, &eventPool)
+		manager.StartWorker(ctx, batchChan, &eventPool)
 	}()
 
 	// drain the incoming events from ringbuff as fast as possible
@@ -77,7 +76,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							*e = ParsedEvent{}
 							eventPool.Put(e)
 						}
-						metricChan <- MemFreed{From: 2, TotalFreed: uint64(len(currentBatch))}
+						manager.ReportUserspaceDrops(uint64(len(currentBatch)))
 					}
 					currentBatch = make(ParsedEventBatch, 0, BATCH_SIZE)
 				}
@@ -128,7 +127,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							*e = ParsedEvent{}
 							eventPool.Put(e)
 						}
-						metricChan <- MemFreed{From: 2, TotalFreed: uint64(len(currentBatch))} // Log the userspace drop
+						manager.ReportUserspaceDrops(uint64(len(currentBatch))) // Log the userspace drop
 					}
 					currentBatch = make([]*ParsedEvent, 0, BATCH_SIZE)
 				}
@@ -177,7 +176,6 @@ func Monitor(targetPid uint32, p *tea.Program) {
 		defer wg.Done()
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		var memFreed = MemFreed{From: 0}
 		for {
 			select {
 			case <-ctx.Done():
@@ -194,8 +192,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 					totalDrops += c
 				}
 				if totalDrops > 0 {
-					memFreed.TotalFreed = totalDrops
-					metricChan <- memFreed
+					manager.ReportKernelDrops(totalDrops)
 				}
 			}
 		}
@@ -239,5 +236,20 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	<-ctx.Done()
 	rd.Close()
 	wg.Wait()
+
+	// log if the ring buffer was full before shutdown. For benchmarks
+	var key uint32
+	var perCPU []uint64
+	if err := objs.MuonMaps.DropCounter.Lookup(&key, &perCPU); err == nil {
+		var total uint64
+		for _, c := range perCPU {
+			total += c
+		}
+		manager.ReportKernelDrops(total)
+	}
+	if d, u := manager.state.dropCount.Load(), manager.state.uspaceDrops.Load(); d != 0 || u != 0 {
+		log.Printf("WARNING: Ring buffer was full (kernel: %d, userspace: %d)", d, u)
+	}
+
 	log.Println("Exit successful.")
 }

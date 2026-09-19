@@ -28,11 +28,6 @@ type AllocKey struct {
 	PID  uint32
 }
 
-type MemFreed struct {
-	From       int
-	TotalFreed uint64
-}
-
 type ParsedEvent struct {
 	PID       uint32
 	Comm      [16]byte
