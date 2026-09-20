@@ -13,6 +13,7 @@ export LC_NUMERIC=C
 MUON_BIN="./muon"
 RESULTS_FILE="/tmp/muon_bench_results.txt"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SCRIPT_DIR
 
 # CPU Core Pinning
 WORKLOAD_CORES="4,5,6,7"
@@ -22,14 +23,18 @@ MUON_CORE="0"
 FAST_MODE=0
 MUON_ONLY=0
 TRACERS_ONLY=0
+PUBLICATION=0
 WARMUP=0
+SWEEP=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST_MODE=1 ;;
     --muon-only) MUON_ONLY=1 ;;
     --tracers-only) TRACERS_ONLY=1 ;;
+    --publication) PUBLICATION=1 ;;
+    --sweep) SWEEP=1 ;;
     *)
-      echo "Unknown option: $arg (supported: --fast, --muon-only, --tracers-only)"
+      echo "Unknown option: $arg (supported: --fast, --muon-only, --tracers-only, --publication, --sweep)"
       exit 1
       ;;
   esac
@@ -66,6 +71,14 @@ else
     echo "============================================="
     echo " Muon Benchmark Suite [FULL MODE]"
     echo "============================================="
+fi
+
+if [[ "$PUBLICATION" -eq 1 ]]; then
+  echo " PUBLICATION MODE — includes the kernel-compile workload"
+fi
+
+if [[ "$SWEEP" -eq 1 ]]; then
+  echo " SWEEP MODE — capacity scan runs after the standard categories"
 fi
 
 # Muon-only mode keeps its own results file so it never clobbers a full run.
@@ -659,6 +672,75 @@ run_category_rounds "${CELL_SPECS[@]}"
 #   "Muon||$MUON_BIN attach -p $$ --headless|$MIXED_WORKLOAD|mixed"
 # )
 # run_category_rounds "${CELL_SPECS[@]}"
+
+# --- 4. go-build ---
+# `find ... -exec touch` only refreshes mtimes of Go sources (git-neutral, no
+# content change); build output goes to /tmp so the repo stays clean. The Go
+# toolchain is checked once here, not on every run.
+if ! command -v go >/dev/null 2>&1; then
+  echo "ABORT: go toolchain not found in PATH — required for the go-build category." >&2
+  exit 1
+fi
+GOBUILD_WORKLOAD="cd \"\$SCRIPT_DIR\" && find . -name '*.go' -exec touch {} + && go build -o /tmp/muon_build_test ."
+echo ""
+echo "========================================="
+echo " CATEGORY 4: go-build"
+echo "========================================="
+CELL_SPECS=(
+  "Baseline|||$GOBUILD_WORKLOAD|gobuild"
+  "strace|strace -f -e trace=execve,exit,openat,mmap,brk,munmap -o /dev/null||$GOBUILD_WORKLOAD|gobuild"
+  "perf trace|perf trace -e execve,exit,openat,mmap,brk,munmap -o /dev/null --||$GOBUILD_WORKLOAD|gobuild"
+  "Muon||$MUON_BIN attach -p $$ --headless|$GOBUILD_WORKLOAD|gobuild"
+)
+run_category_rounds "${CELL_SPECS[@]}"
+
+# --- 5. kernel-compile (--publication only) ---
+echo ""
+echo "========================================="
+echo " CATEGORY 5: kernel-compile"
+echo "========================================="
+if [ "$PUBLICATION" -eq 1 ]; then
+  KERNEL_SRC="${KERNEL_SRC:-$HOME/linux}"
+  if [ ! -f "$KERNEL_SRC/Makefile" ]; then
+    echo "ABORT: no kernel tree at $KERNEL_SRC (Makefile missing)." >&2
+    echo "Set KERNEL_SRC to a configured kernel tree, then re-run." >&2
+    exit 1
+  fi
+  export KERNEL_SRC
+
+  # One untimed defconfig so every timed build starts from a known config.
+  if ! make -C "$KERNEL_SRC" defconfig >/dev/null 2>&1; then
+    echo "ABORT: make -C $KERNEL_SRC defconfig failed." >&2
+    exit 1
+  fi
+
+  # Each kernel build is ~10 min, so publication uses 3 timed rounds and a
+  # single warmup; the suite defaults are restored right after.
+  SAVED_ITERATIONS="$ITERATIONS"
+  SAVED_WARMUP="$WARMUP"
+  ITERATIONS=3
+  WARMUP=1
+
+  # -j4 matches the 4 cores pinned for workloads (WORKLOAD_CORES).
+  KBUILD_WORKLOAD="make -C \"\$KERNEL_SRC\" clean >/dev/null && make -C \"\$KERNEL_SRC\" -j4"
+  CELL_SPECS=(
+    "Baseline|||$KBUILD_WORKLOAD|kbuild"
+    "strace|strace -f -e trace=execve,exit,openat,mmap,brk,munmap -o /dev/null||$KBUILD_WORKLOAD|kbuild"
+    "perf trace|perf trace -e execve,exit,openat,mmap,brk,munmap -o /dev/null --||$KBUILD_WORKLOAD|kbuild"
+    "Muon||$MUON_BIN attach -p $$ --headless|$KBUILD_WORKLOAD|kbuild"
+  )
+  run_category_rounds "${CELL_SPECS[@]}"
+
+  ITERATIONS="$SAVED_ITERATIONS"
+  WARMUP="$SAVED_WARMUP"
+else
+  echo "  [publication-skip] kernel-compile requires --publication"
+fi
+
+# --- Capacity sweep (--sweep only) ---
+if [[ "$SWEEP" -eq 1 ]]; then
+  run_sweep
+fi
 
 # =============================================================================
 # SUMMARY
