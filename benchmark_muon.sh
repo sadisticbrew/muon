@@ -12,6 +12,7 @@ export LC_NUMERIC=C
 
 MUON_BIN="./muon"
 RESULTS_FILE="/tmp/muon_bench_results.txt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # CPU Core Pinning
 WORKLOAD_CORES="4,5,6,7"
@@ -21,6 +22,7 @@ MUON_CORE="0"
 FAST_MODE=0
 MUON_ONLY=0
 TRACERS_ONLY=0
+WARMUP=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST_MODE=1 ;;
@@ -44,11 +46,13 @@ if [[ "$FAST_MODE" -eq 1 ]]; then
     MIXED_OPEN_OPS=20000
     MIXED_MMAP_OPS=500
 
+    WARMUP=1
+
     echo "============================================="
     echo " Muon Benchmark Suite [FAST DEV MODE]"
     echo "============================================="
 else
-    ITERATIONS=7
+    ITERATIONS=10
     EXEC_OPS=10000
     OPEN_OPS=300000
     MMAP_OPS=15000
@@ -56,6 +60,8 @@ else
     MIXED_EXEC_OPS=2000
     MIXED_OPEN_OPS=100000
     MIXED_MMAP_OPS=5000
+
+    WARMUP=2
 
     echo "============================================="
     echo " Muon Benchmark Suite [FULL MODE]"
@@ -76,16 +82,155 @@ fi
 
 > "$RESULTS_FILE"
 
+# Drop stale per-run artifacts from any earlier session so no leftover
+# .times/.log/.txt file can ever bleed into this session's measurements.
+rm -f /tmp/muon_*.log /tmp/muon_res_*.txt /tmp/muon_workload_err_*.txt \
+  /tmp/muon_cell_*.times /tmp/muon_lastres.txt /tmp/muon_time.txt
+
+# Save each CPU's current governor so restore_governors() can put it back.
+declare -A SAVED_GOVERNORS=()
 for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+  [ -r "$gov_file" ] || continue
+  governor=$(cat "$gov_file" 2>/dev/null)
+  [ -n "$governor" ] && SAVED_GOVERNORS["$gov_file"]="$governor"
   echo performance > "$gov_file" 2>/dev/null
 done
 
 restore_governors() {
+  local gov_file
   for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo powersave > "$gov_file" 2>/dev/null
+    echo "${SAVED_GOVERNORS["$gov_file"]:-powersave}" > "$gov_file" 2>/dev/null
   done
 }
 trap restore_governors EXIT
+
+# =============================================================================
+# HYBRID-CORE PINNING SANITY CHECK
+# =============================================================================
+
+cpu_freq_khz() {
+  local cpu="$1"
+  local base="/sys/devices/system/cpu/cpu${cpu}/cpufreq/base_frequency"
+  local maxf="/sys/devices/system/cpu/cpu${cpu}/cpufreq/cpuinfo_max_freq"
+  if [ -r "$base" ]; then
+    cat "$base" 2>/dev/null
+  elif [ -r "$maxf" ]; then
+    cat "$maxf" 2>/dev/null
+  else
+    echo "unknown"
+  fi
+}
+
+IFS=',' read -r -a WORKLOAD_CORE_LIST <<< "$WORKLOAD_CORES"
+WORKLOAD_FREQS=()
+for core in "${WORKLOAD_CORE_LIST[@]}"; do
+  WORKLOAD_FREQS+=("$(cpu_freq_khz "$core")")
+done
+
+heterogeneous=0
+for idx in "${!WORKLOAD_FREQS[@]}"; do
+  if [ "${WORKLOAD_FREQS[$idx]}" != "${WORKLOAD_FREQS[0]}" ]; then
+    heterogeneous=1
+    break
+  fi
+done
+
+if [ "$heterogeneous" -eq 1 ]; then
+  echo "ABORT: workload cores ${WORKLOAD_CORES} are heterogeneous in frequency:" >&2
+  for idx in "${!WORKLOAD_CORE_LIST[@]}"; do
+    echo "  cpu${WORKLOAD_CORE_LIST[$idx]}: ${WORKLOAD_FREQS[$idx]} kHz" >&2
+  done
+  echo "Pin WORKLOAD_CORES to cores of equal base/max frequency and retry." >&2
+  exit 1
+fi
+
+MUON_FREQ=$(cpu_freq_khz "$MUON_CORE")
+CORE_MAP_LINE="coremap: workload=${WORKLOAD_CORES}@${WORKLOAD_FREQS[0]} muon=${MUON_CORE}@${MUON_FREQ}"
+echo "$CORE_MAP_LINE" >> "$RESULTS_FILE"
+echo "$CORE_MAP_LINE"
+
+# =============================================================================
+# ENVIRONMENT DUMP (separate .env file next to the results; never the CSV)
+# =============================================================================
+
+ENV_FILE="${RESULTS_FILE%.txt}.env"
+{
+  echo "== Environment =="
+  echo "kernel: $(uname -r)"
+  echo "cpu: $(lscpu 2>/dev/null | grep 'Model name' | sed 's/^[[:space:]]*//')"
+  for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -r "$gov_file" ] || continue
+    echo "governor $(basename "$(dirname "$(dirname "$gov_file")")"): $(cat "$gov_file" 2>/dev/null)"
+  done
+  if [ -r /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+    echo "turbo: intel_pstate/no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)"
+  elif [ -r /sys/devices/system/cpu/cpufreq/boost ]; then
+    echo "turbo: cpufreq/boost=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)"
+  else
+    echo "turbo: no intel_pstate/no_turbo or cpufreq/boost knob present"
+  fi
+  for vuln in /sys/devices/system/cpu/vulnerabilities/*; do
+    [ -r "$vuln" ] || continue
+    echo "mitigation $(basename "$vuln"): $(cat "$vuln" 2>/dev/null)"
+  done
+  echo "muon git sha: $(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "muon git dirty (first 3 lines):"
+  git -C "$SCRIPT_DIR" status --short 2>/dev/null | head -3
+  echo "muon binary sha256: $(sha256sum "$MUON_BIN" 2>/dev/null || echo unavailable)"
+} > "$ENV_FILE" 2>&1
+cat "$ENV_FILE"
+
+# =============================================================================
+# POWER / THERMAL GUARDS
+# =============================================================================
+
+# Full runs must be on AC; --fast dev runs on battery are allowed with a warning.
+# Machines without power_supply entries proceed with a warning.
+check_power_supply() {
+  local online_files=(/sys/class/power_supply/*/online)
+  if [ ! -e "${online_files[0]}" ]; then
+    echo "WARNING: no /sys/class/power_supply/*/online entries found — cannot verify AC power."
+    return 0
+  fi
+
+  local ac_online=0 supply
+  for supply in "${online_files[@]}"; do
+    [ -r "$supply" ] || continue
+    if [ "$(cat "$supply" 2>/dev/null)" = "1" ]; then
+      ac_online=1
+      break
+    fi
+  done
+
+  if [ "$ac_online" -eq 0 ]; then
+    if [ "$FAST_MODE" -eq 1 ]; then
+      echo "WARNING: no AC supply online (on battery) — --fast mode, timings may be noisy."
+    else
+      echo "ABORT: no AC supply online (running on battery). Plug in AC or rerun with --fast." >&2
+      exit 1
+    fi
+  fi
+}
+
+# Abort when any thermal zone is above 95°C so throttled numbers are never recorded.
+check_thermal() {
+  local max_temp=0 zone temp
+  for zone in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$zone" ] || continue
+    temp=$(cat "$zone" 2>/dev/null)
+    [[ "$temp" =~ ^[0-9]+$ ]] || continue
+    if [ "$temp" -gt "$max_temp" ]; then
+      max_temp="$temp"
+    fi
+  done
+
+  if [ "$max_temp" -gt 95000 ]; then
+    echo "ABORT: thermal zone at $((max_temp / 1000))°C (>95°C) — refusing to record throttled results." >&2
+    exit 1
+  fi
+}
+
+check_power_supply
 
 # =============================================================================
 # STATS HELPER
