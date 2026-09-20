@@ -246,6 +246,14 @@ check_thermal() {
 
 check_power_supply
 
+# The exec workload drops privileges via sudo; with SUDO_USER empty every
+# exec run fails and the session would die at the first warmup. Fail here
+# with an actionable message instead.
+if [ -z "${SUDO_USER:-}" ]; then
+  echo "ABORT: SUDO_USER is empty — run via 'sudo ./benchmark_muon.sh ...' from your user account, not from a root shell." >&2
+  exit 1
+fi
+
 # =============================================================================
 # STATS HELPER
 # =============================================================================
@@ -304,6 +312,29 @@ declare -A CELL_CPU_SUM=()
 declare -A CELL_CPU_COUNT=()
 declare -A CELL_RSS_MAX=()
 
+# Stop a tracer pipeline started as `setsid taskset ... time ... muon &`.
+# $1 is the pipeline leader PID, which (via setsid) is also its PGID.
+# Order matters: TERM the tracer (time's child) FIRST so it can print its
+# shutdown tally and — critically — so `time` observes a normal child exit
+# and writes its -v report. Only then group-kill any stragglers. Killing the
+# group outright would take `time` down before it writes the report (losing
+# CPU/RSS figures) — and killing just the leader would orphan the tracer.
+stop_muon() {
+  local leader="$1"
+  [ -n "$leader" ] || return 0
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -SIGTERM -P "$leader" 2>/dev/null
+    local w
+    for ((w=0; w<50; w++)); do
+      kill -0 "$leader" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  kill -SIGTERM -- "-$leader" 2>/dev/null
+  wait "$leader" 2>/dev/null
+  return 0
+}
+
 # =============================================================================
 # SINGLE RUN HELPER
 # =============================================================================
@@ -317,6 +348,7 @@ declare -A CELL_RSS_MAX=()
 #   2 = invalid timing output (run dropped)
 #   3 = ring buffer full warning (run dropped)
 #   4 = Muon ran but observed zero events (run dropped)
+#   5 = workload command itself failed (run dropped)
 # When bg_cmd is set, Muon runs under /usr/bin/time -v and its CPU%/max-RSS
 # are published via /tmp/muon_lastres.txt (a file, because callers invoke this
 # function inside a command-substitution subshell that cannot export vars).
@@ -339,7 +371,11 @@ single_run() {
   local muon_res="/tmp/muon_res_${safe_tag}.txt"
   if [ -n "$bg_cmd" ]; then
     rm -f "$muon_res"
-    taskset -c "$MUON_CORE" /usr/bin/time -v -o "$muon_res" $bg_cmd > "$muon_log" 2>&1 &
+    # setsid puts the whole tracer pipeline (taskset/time/muon) in its own
+    # process group so teardown can signal ALL of it: killing just $! would
+    # take down `time` and orphan a still-tracing Muon on every run, leaking
+    # tracers that contaminate later cells and defeat drop/event detection.
+    setsid taskset -c "$MUON_CORE" /usr/bin/time -v -o "$muon_res" $bg_cmd > "$muon_log" 2>&1 &
     muon_pid=$!
   fi
 
@@ -349,16 +385,16 @@ single_run() {
     if ! kill -0 "$muon_pid" 2>/dev/null; then
       echo "  $tag: FATAL — Muon exited before the run started:" >&2
       tail -n 10 "$muon_log" | sed 's/^/    /' >&2
-      kill "$muon_pid" 2>/dev/null
-      wait "$muon_pid" 2>/dev/null
+      stop_muon "$muon_pid"
+      printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
       rm -f "$muon_log"
       return 1
     fi
     if ! grep -q "Muon ready" "$muon_log" 2>/dev/null; then
       echo "  $tag: FATAL — Muon never reported ready:" >&2
       tail -n 10 "$muon_log" | sed 's/^/    /' >&2
-      kill "$muon_pid" 2>/dev/null
-      wait "$muon_pid" 2>/dev/null
+      stop_muon "$muon_pid"
+      printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
       rm -f "$muon_log"
       return 1
     fi
@@ -369,21 +405,30 @@ single_run() {
   # timing file first so a failed/missing time never leaves stale values.
   rm -f /tmp/muon_time.txt
   local workload_err="/tmp/muon_workload_err_${safe_name}_${safe_tag}.txt"
+  # Workload stdout is discarded: it would otherwise flow into this function's
+  # stdout and contaminate the caller's $(...) capture (stress-ng prints its
+  # own summary to stdout). Timing comes from muon_time.txt, diagnostics from
+  # the stderr file — stdout is needed by nothing.
+  # /usr/bin/time propagates the workload's exit status, so a silently
+  # failing workload (bad flags, missing binary, OOM) can never masquerade
+  # as a fast valid run.
+  local workload_rc=0
   if [ -n "$prefix_cmd" ]; then
     /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
       taskset -c "$WORKLOAD_CORES" $prefix_cmd bash -c "$workload" \
-      2> "$workload_err"
+      >/dev/null 2> "$workload_err"
+    workload_rc=$?
   else
     /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
       taskset -c "$WORKLOAD_CORES" bash -c "$workload" \
-      2> "$workload_err"
+      >/dev/null 2> "$workload_err"
+    workload_rc=$?
   fi
 
   local drop_warning=0
   local zero_events=0
   if [ -n "$muon_pid" ]; then
-    kill -SIGTERM "$muon_pid" > /dev/null 2>&1
-    wait "$muon_pid" 2>/dev/null
+    stop_muon "$muon_pid"
 
     # Extract Muon's CPU%/max-RSS from /usr/bin/time -v. Missing or malformed
     # fields simply become empty and never change this run's return code.
@@ -454,8 +499,8 @@ single_run() {
 }
 
 # Untimed warmup for one cell: WARMUP iterations via single_run, timing
-# discarded. A broken setup aborts the session immediately instead of burning
-# every remaining round. Also truncates the cell's times file so runs from an
+# discarded. Reports failure to the caller (which decides abort vs disable)
+# instead of exiting. Also truncates the cell's times file so runs from an
 # earlier session can never bleed into this one.
 warm_cell() {
   local name="$1"
@@ -476,8 +521,8 @@ warm_cell() {
     warm_rc=0
     single_run "$name" "$prefix_cmd" "$bg_cmd" "$workload" 0 "Warmup $w" || warm_rc=$?
     if [ "$warm_rc" -ne 0 ]; then
-      echo ">> ABORT: warmup $w/$WARMUP failed (rc=$warm_rc) for $name — setup is broken. <<" >&2
-      exit 1
+      echo ">> CELL FAILED: warmup $w/$WARMUP failed (rc=$warm_rc) for $name. <<" >&2
+      return 1
     fi
     echo "  Warmup $w/$WARMUP: complete (timing discarded)"
   done
@@ -507,6 +552,13 @@ timed_round() {
     return
   fi
   if [ "$run_rc" -ne 0 ]; then
+    CELL_DROPPED["$key"]=$(( ${CELL_DROPPED["$key"]:-0} + 1 ))
+    return
+  fi
+
+  # Belt and braces: only a clean numeric timing may enter the times file.
+  if [[ ! "$run_out" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "  Run $round: non-numeric timing captured (dropping run)" >&2
     CELL_DROPPED["$key"]=$(( ${CELL_DROPPED["$key"]:-0} + 1 ))
     return
   fi
@@ -603,16 +655,28 @@ run_category_rounds() {
 
   [ "${#active_specs[@]}" -eq 0 ] && return 0
 
+  # Warm every cell. A failed Muon/Baseline warmup aborts the session (the
+  # core pipeline is broken, nothing measured afterwards would mean
+  # anything). A failed strace/perf warmup only disables that comparator
+  # cell — it still gets an INVALID row at finalize, and the session goes on.
+  local -a round_specs=()
   for spec in "${active_specs[@]}"; do
     IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
-    warm_cell "$name" "$prefix_cmd" "$bg_cmd" "$workload" "$category"
+    if warm_cell "$name" "$prefix_cmd" "$bg_cmd" "$workload" "$category"; then
+      round_specs+=("$spec")
+    elif [[ "$name" == "Muon" || "$name" == "Baseline" ]]; then
+      echo ">> ABORT: warmup failed for core cell $name — setup is broken. <<" >&2
+      exit 1
+    else
+      echo ">> CELL DISABLED: $name warmup failed — comparator unavailable, reporting INVALID. <<"
+    fi
   done
 
   local r
   for r in $(seq 1 $ITERATIONS); do
     echo ""
     echo "Round $r/$ITERATIONS [$category_label]"
-    for spec in "${active_specs[@]}"; do
+    for spec in "${round_specs[@]}"; do
       IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
       check_thermal
       timed_round "$name" "$prefix_cmd" "$bg_cmd" "$workload" "$category" "$r"
