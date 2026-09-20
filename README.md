@@ -15,6 +15,7 @@ The existing tools didn't work for me:
 
 So I wrote Muon: attach to a PID, watch the syscalls stream by, detach. Overhead stays low because the filtering happens in kernel space -- only events from the process tree you're attached to ever reach userspace.
 
+<!-- BENCH-START -->
 ## Benchmarks
 
 I benchmarked Muon against `perf trace` and `strace` on a machine with a locked CPU governor, running each workload repeatedly and averaging the runs. These numbers are from my machine so treat them as directional, but the gap between ptrace and eBPF is not subtle.
@@ -57,6 +58,7 @@ Flood the system with file opens and see who drowns.
 | strace (ptrace) | 9.772s | ~99.4% | ±0.402s |
 
 \*Muon finished faster than the baseline here. The difference sits within the baseline's standard deviation (±0.156s), so the honest reading is: file I/O tracing overhead is zero.
+<!-- BENCH-END -->
 
 ## What it tracks
 

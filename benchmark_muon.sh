@@ -1041,3 +1041,27 @@ else
   echo "  Verdict: NOISE when |tracer_avg - baseline_avg| < 2 * sqrt(tracer_stddev^2 + baseline_stddev^2), else REAL"
 fi
 echo ""
+
+# =============================================================================
+# ARCHIVE THIS RUN (results + env + metadata under bench/results/<stamp>)
+# =============================================================================
+CPU_TAG=$(lscpu 2>/dev/null | sed -n 's/^[[:space:]]*Model name:[[:space:]]*//p' | head -n 1 \
+  | sed -E 's/\((R|TM|r|tm)\)//g; s/\b(Intel|AMD|Core|CPU|Processor|Genuine)\b//gI' \
+  | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+[ -n "$CPU_TAG" ] || CPU_TAG="unknown"
+STAMP="$(date +%Y%m%d-%H%M%S)-$(uname -r)-${CPU_TAG}"
+DEST="$SCRIPT_DIR/bench/results/$STAMP"
+mkdir -p "$DEST"
+[ -f "$RESULTS_FILE" ] && cp "$RESULTS_FILE" "$DEST/results.csv"
+[ -f "$ENV_FILE" ] && cp "$ENV_FILE" "$DEST/env.txt"
+{
+  echo "date_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "mode: FAST=$FAST_MODE MUON_ONLY=$MUON_ONLY TRACERS_ONLY=$TRACERS_ONLY PUBLICATION=$PUBLICATION SWEEP=$SWEEP"
+  echo "iterations: $ITERATIONS"
+  echo "warmup: $WARMUP"
+  if [ -f "$RESULTS_FILE" ]; then
+    first_line=$(head -n 1 "$RESULTS_FILE" 2>/dev/null)
+    [[ "$first_line" == coremap:* ]] && echo "$first_line"
+  fi
+} > "$DEST/meta.txt"
+echo "Results archived to bench/results/$STAMP"
