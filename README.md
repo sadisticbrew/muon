@@ -85,12 +85,26 @@ You need:
 
 - Linux 5.8+ (ring buffer support)
 - `clang`, `llvm` and `bpftool`
-- Go 1.24+
+- Go 1.26+
 
 ```bash
 make vmlinux   # generate kernel headers
 make run       # build and run
 ```
+
+## Benchmark harness
+
+`benchmark_muon.sh` (run as root) measures Muon against `strace` and `perf trace` with locked governors, core pinning, interleaved rounds and trimmed statistics. Every session is validity-gated: a child-tracking smoke test runs first, and any run with dropped events, zero observed events or a failed workload is discarded, never averaged.
+
+```bash
+sudo ./benchmark_muon.sh --fast --muon-only   # ~3 min dev check
+sudo ./benchmark_muon.sh                      # ~1 h full suite
+sudo ./benchmark_muon.sh --sweep               # + capacity scan (max drop-free events/s)
+sudo ./benchmark_muon.sh --publication         # + kernel-compile workload (hours)
+sudo ./benchmark_muon.sh --regress             # fail if overhead regressed vs bench/baseline.json
+```
+
+Results archive to `bench/results/<timestamp>/` (CSV + env + metadata); `bench/report.sh` regenerates the tables above from an archive; `bench/probe_cost.sh` measures in-kernel per-probe cost via BPF stats.
 
 ## Roadmap
 
