@@ -26,6 +26,7 @@ TRACERS_ONLY=0
 PUBLICATION=0
 WARMUP=0
 SWEEP=0
+REGRESS=off
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST_MODE=1 ;;
@@ -33,8 +34,16 @@ for arg in "$@"; do
     --tracers-only) TRACERS_ONLY=1 ;;
     --publication) PUBLICATION=1 ;;
     --sweep) SWEEP=1 ;;
+    --regress) REGRESS=fail ;;
+    --regress=*)
+      REGRESS="${arg#--regress=}"
+      if [[ "$REGRESS" != "warn" && "$REGRESS" != "fail" ]]; then
+        echo "Invalid --regress value: '$REGRESS' (accepted: warn, fail)" >&2
+        exit 1
+      fi
+      ;;
     *)
-      echo "Unknown option: $arg (supported: --fast, --muon-only, --tracers-only, --publication, --sweep)"
+      echo "Unknown option: $arg (supported: --fast, --muon-only, --tracers-only, --publication, --sweep, --regress[=warn|fail])"
       exit 1
       ;;
   esac
@@ -79,6 +88,10 @@ fi
 
 if [[ "$SWEEP" -eq 1 ]]; then
   echo " SWEEP MODE — capacity scan runs after the standard categories"
+fi
+
+if [[ "$REGRESS" != "off" ]]; then
+  echo " REGRESS MODE ($REGRESS) — comparing against bench/baseline.json"
 fi
 
 # Muon-only mode keeps its own results file so it never clobbers a full run.
@@ -1065,3 +1078,183 @@ mkdir -p "$DEST"
   fi
 } > "$DEST/meta.txt"
 echo "Results archived to bench/results/$STAMP"
+
+# =============================================================================
+# REGRESSION GATE (--regress[=warn|fail])
+# =============================================================================
+
+# Compares this run's overheads against bench/baseline.json (written by
+# bench/report.sh --init-baseline). Runs after the archive so the archived
+# results.csv exists whatever the verdict. Returns 1 only when mode=fail and
+# at least one cell fails; warn mode always returns 0.
+run_regress() {
+  BASELINE_JSON="$SCRIPT_DIR/bench/baseline.json"
+
+  if [ ! -f "$BASELINE_JSON" ]; then
+    echo "REGRESS SKIPPED: no bench/baseline.json (create one with: bench/report.sh <results-dir> --init-baseline)"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "REGRESS ERROR: python3 required to evaluate" >&2
+    return 2
+  fi
+
+  # CSV overheads are recomputed from raw avg/stddev with the same formulas as
+  # the awk summary; the baseline stores independently measured overheads, so
+  # only the deltas between the two are comparable.
+  python3 - "$RESULTS_FILE" "$BASELINE_JSON" "$REGRESS" <<'PY'
+import json
+import math
+import re
+import sys
+
+
+def main():
+    csv_path, baseline_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    try:
+        with open(baseline_path) as fh:
+            baseline = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"REGRESS ERROR: cannot read baseline {baseline_path}: {exc}", file=sys.stderr)
+        return 2
+
+    base_cells = baseline.get("cells") or {}
+    base_cap = baseline.get("capacity_ev_per_s")
+
+    base_rows = {}
+    new_cells = {}
+    invalid = set()
+    sweep_best = None
+
+    try:
+        with open(csv_path) as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("coremap:"):
+                    continue
+                if line.startswith("sweep:"):
+                    ev = re.search(r"ev_per_s=(\d+)", line)
+                    st = re.search(r"status=(\w+)", line)
+                    if ev and st and st.group(1) == "CLEAN":
+                        val = int(ev.group(1))
+                        if sweep_best is None or val > sweep_best:
+                            sweep_best = val
+                    continue
+                parts = line.split(",")
+                if len(parts) < 4:
+                    continue
+                cat, name, avg_s = parts[0], parts[1], parts[2]
+                key = f"{cat}:{name}"
+                if avg_s == "INVALID":
+                    invalid.add(key)
+                    continue
+                try:
+                    avg = float(avg_s)
+                    sd = float(parts[3])
+                except ValueError:
+                    continue
+                if name == "Baseline":
+                    base_rows[cat] = (avg, sd)
+                else:
+                    new_cells[key] = (avg, sd)
+    except OSError as exc:
+        print(f"REGRESS ERROR: cannot read results {csv_path}: {exc}", file=sys.stderr)
+        return 2
+
+    def baseline_oh_err(key):
+        cell = base_cells.get(key) or {}
+        try:
+            return float(cell.get("overhead_pct", 0.0)), float(cell.get("overhead_err", 0.0))
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
+    rows = []
+    notes = []
+    fails = 0
+    warns = 0
+
+    for key in sorted(new_cells):
+        cat = key.split(":", 1)[0]
+        base = base_rows.get(cat)
+        if base is None or base[0] == 0:
+            if key in base_cells:
+                rows.append((key, baseline_oh_err(key)[0], None, None, "SKIP"))
+            notes.append(f"REGRESS NOTE: {key} skipped — no Baseline cell for '{cat}' in this run")
+            continue
+        if key not in base_cells:
+            notes.append(f"REGRESS NOTE: {key} is NEW (not in baseline; info only)")
+            continue
+
+        T, St = new_cells[key]
+        B, Sb = base
+        new_oh = (T - B) / B * 100.0
+        new_err = 100.0 * math.sqrt((St / B) ** 2 + (T * Sb / (B * B)) ** 2)
+        base_oh, base_err = baseline_oh_err(key)
+        gap = new_oh - base_oh
+        noise = 2.0 * math.sqrt(new_err ** 2 + base_err ** 2)
+        # EPS keeps IEEE754 dust (e.g. 3.000000000000007) from flipping a
+        # verdict sitting exactly on a threshold.
+        EPS = 1e-9
+
+        if gap > 3.0 + EPS and gap > noise:
+            verdict = "FAIL"
+            fails += 1
+        elif gap > 3.0 + EPS:
+            verdict = "WARN"
+            warns += 1
+        elif gap < -3.0 - EPS and abs(gap) > noise:
+            verdict = "IMPROVED"
+        else:
+            verdict = "OK"
+        rows.append((key, base_oh, new_oh, gap, verdict))
+
+    for key in sorted(base_cells):
+        if key in new_cells:
+            continue
+        state = "INVALID in this run" if key in invalid else "missing from this run"
+        rows.append((key, baseline_oh_err(key)[0], None, None, "SKIP"))
+        notes.append(f"REGRESS NOTE: {key} skipped ({state}; never fails)")
+
+    print("")
+    print("REGRESS REPORT")
+    print(f"{'Cell':<26} {'Base%':>9} {'New%':>9} {'Gap':>9}  Verdict")
+    print("-" * 68)
+    for key, base_oh, new_oh, gap, verdict in rows:
+        b = "n/a" if base_oh is None else f"{base_oh:+.2f}"
+        n = "n/a" if new_oh is None else f"{new_oh:+.2f}"
+        g = "n/a" if gap is None else f"{gap:+.2f}"
+        print(f"{key:<26} {b:>9} {n:>9} {g:>9}  {verdict}")
+    for note in notes:
+        print(note)
+
+    if sweep_best is not None and base_cap is not None:
+        if base_cap and sweep_best < 0.8 * base_cap:
+            warns += 1
+            print(f"REGRESS CAPACITY: WARN — CLEAN {sweep_best} events/s < 0.8 x baseline {base_cap} events/s")
+        else:
+            print(f"REGRESS CAPACITY: OK — CLEAN {sweep_best} events/s vs baseline {base_cap} events/s")
+    elif sweep_best is not None:
+        print(f"REGRESS CAPACITY: {sweep_best} events/s (baseline has no capacity figure; info only)")
+    else:
+        print("REGRESS CAPACITY: no CLEAN sweep in this run (info only)")
+
+    if fails > 0:
+        if mode == "fail":
+            print(f"REGRESS FAIL ({fails})")
+            return 1
+        print(f"REGRESS WARN: {fails} cell(s) over the fail threshold — warn mode, not failing")
+    print(f"REGRESS PASS ({warns} warning(s))" if warns else "REGRESS PASS")
+    return 0
+
+
+sys.exit(main())
+PY
+}
+
+if [[ "$REGRESS" != "off" ]]; then
+  run_regress
+fi
