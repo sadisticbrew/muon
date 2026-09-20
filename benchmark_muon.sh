@@ -8,12 +8,22 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+export LC_ALL=C
 export LC_NUMERIC=C
 
 MUON_BIN="./muon"
 RESULTS_FILE="/tmp/muon_bench_results.txt"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
+
+# Session stamp, computed once up front so both the normal archive and the
+# abort-path preservation in session_cleanup use the same directory name.
+CPU_TAG=$(lscpu 2>/dev/null | sed -n 's/^[[:space:]]*Model name:[[:space:]]*//p' | head -n 1 \
+  | sed -E 's/\((R|TM|r|tm)\)//g; s/\b(Intel|AMD|Core|CPU|Processor|Genuine)\b//gI' \
+  | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+[ -n "$CPU_TAG" ] || CPU_TAG="unknown"
+STAMP="$(date +%Y%m%d-%H%M%S)-$(uname -r)-${CPU_TAG}"
+ARCHIVED=0
 
 # CPU Core Pinning
 WORKLOAD_CORES="4,5,6,7"
@@ -110,9 +120,66 @@ fi
 
 # Drop stale per-run artifacts from any earlier session so no leftover
 # .times/.log/.txt file can ever bleed into this session's measurements.
+LIVE_PGID_FILE="/tmp/muon_live.pgid"
 rm -f /tmp/muon_*.log /tmp/muon_res_*.txt /tmp/muon_workload_err_*.txt \
   /tmp/muon_cell_*.times /tmp/muon_lastres.txt /tmp/muon_time.txt \
-  /tmp/muon_lastevents.txt
+  /tmp/muon_lastevents.txt "$LIVE_PGID_FILE"
+
+# One session at a time: concurrent runs would fight over governors, pinned
+# cores, the results file and every /tmp channel above. Hold an exclusive
+# lock for the whole session (fd stays open, so the lock releases on exit).
+exec 200>/tmp/muon_bench.lock
+if ! flock -n 200 2>/dev/null; then
+  echo "ABORT: another benchmark session holds /tmp/muon_bench.lock." >&2
+  echo "Concurrent sessions would corrupt each other's results — wait for it to finish." >&2
+  exit 1
+fi
+
+# Fail fast on missing tools, before touching system state or measuring
+# anything. Lists are mode-aware: comparators only matter outside
+# --muon-only, make only for --publication, python3 only for --regress.
+require_tool() {
+  local t
+  for t in $1; do
+    command -v "$t" >/dev/null 2>&1 || {
+      echo "ABORT: required tool '$t' not found in PATH." >&2
+      exit 1
+    }
+  done
+}
+[ -x /usr/bin/time ] || { echo "ABORT: /usr/bin/time missing (need GNU time for resource accounting)." >&2; exit 1; }
+require_tool "setsid taskset awk sort grep flock id"
+require_tool "stress-ng"
+if [[ "$MUON_ONLY" -eq 0 ]]; then
+  require_tool "strace perf"
+fi
+if [[ "$PUBLICATION" -eq 1 ]]; then
+  require_tool "make"
+fi
+if [[ "$REGRESS" != "off" ]]; then
+  require_tool "python3"
+fi
+if command -v pkill >/dev/null 2>&1; then
+  PKILL_OK=1
+else
+  PKILL_OK=0
+  echo "WARNING: pkill not found — tracer shutdown falls back to group kill and tracer CPU/RSS figures will be missing." >&2
+fi
+
+# The exec workload drops privileges via sudo. Accept an explicit override
+# account (CI-as-root, doas/pkexec setups) and validate it exists; never let
+# an empty account reach the first warmup as a cryptic sudo failure.
+SUDO_USER="${SUDO_USER:-${MUON_BENCH_USER:-}}"
+if [ -z "$SUDO_USER" ]; then
+  echo "ABORT: no unprivileged account to run the exec workload as." >&2
+  echo "Run via 'sudo ./benchmark_muon.sh ...' from your user account, or set MUON_BENCH_USER." >&2
+  exit 1
+fi
+if ! id -u "$SUDO_USER" >/dev/null 2>&1; then
+  echo "ABORT: account '$SUDO_USER' does not exist (needed for the exec workload)." >&2
+  exit 1
+fi
+export SUDO_USER
 
 # Save each CPU's current governor so restore_governors() can put it back.
 declare -A SAVED_GOVERNORS=()
@@ -125,11 +192,41 @@ done
 
 restore_governors() {
   local gov_file
-  for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo "${SAVED_GOVERNORS["$gov_file"]:-powersave}" > "$gov_file" 2>/dev/null
+  # Restore only what was actually saved; never invent a governor for a CPU
+  # whose file was unreadable at save time (or that appeared mid-session).
+  for gov_file in "${!SAVED_GOVERNORS[@]}"; do
+    echo "${SAVED_GOVERNORS["$gov_file"]}" > "$gov_file" 2>/dev/null
   done
 }
-trap restore_governors EXIT
+
+# Last-resort session cleanup. Runs on every exit path (normal, abort,
+# Ctrl-C, SIGTERM): restores governors, reaps a tracer pipeline that an
+# external signal may have interrupted mid-run, and preserves partial
+# results when the session died abnormally.
+session_cleanup() {
+  local rc=$?
+  restore_governors
+  if [ -f "$LIVE_PGID_FILE" ]; then
+    local pgid
+    pgid=$(cat "$LIVE_PGID_FILE" 2>/dev/null)
+    if [[ "$pgid" =~ ^[0-9]+$ ]] && kill -0 "-$pgid" 2>/dev/null; then
+      kill -SIGKILL -- "-$pgid" 2>/dev/null
+    fi
+    rm -f "$LIVE_PGID_FILE"
+  fi
+  if [ "$rc" -ne 0 ] && [ "${ARCHIVED:-0}" -eq 0 ] && [ -f "$RESULTS_FILE" ] \
+      && grep -qE '^[^,]+,[^,]+,' "$RESULTS_FILE" 2>/dev/null; then
+    local ab_dest="$SCRIPT_DIR/bench/results/aborted-$STAMP"
+    if mkdir -p "$ab_dest" 2>/dev/null; then
+      cp "$RESULTS_FILE" "$ab_dest/results.csv" 2>/dev/null || echo "WARNING: could not preserve partial results." >&2
+      [ -f "$ENV_FILE" ] && cp "$ENV_FILE" "$ab_dest/env.txt" 2>/dev/null
+      echo "Partial results preserved in bench/results/aborted-$STAMP"
+    fi
+  fi
+  exit "$rc"
+}
+trap session_cleanup EXIT
+trap 'exit 143' INT TERM
 
 # =============================================================================
 # HYBRID-CORE PINNING SANITY CHECK
@@ -155,8 +252,11 @@ for core in "${WORKLOAD_CORE_LIST[@]}"; do
 done
 
 heterogeneous=0
+unverified=0
 for idx in "${!WORKLOAD_FREQS[@]}"; do
-  if [ "${WORKLOAD_FREQS[$idx]}" != "${WORKLOAD_FREQS[0]}" ]; then
+  if [ "${WORKLOAD_FREQS[$idx]}" = "unknown" ]; then
+    unverified=1
+  elif [ "${WORKLOAD_FREQS[$idx]}" != "${WORKLOAD_FREQS[0]}" ] && [ "${WORKLOAD_FREQS[0]}" != "unknown" ]; then
     heterogeneous=1
     break
   fi
@@ -169,6 +269,13 @@ if [ "$heterogeneous" -eq 1 ]; then
   done
   echo "Pin WORKLOAD_CORES to cores of equal base/max frequency and retry." >&2
   exit 1
+fi
+
+if [ "$unverified" -eq 1 ]; then
+  # No cpufreq data (VMs, some ARM) — homogeneity cannot be verified, so the
+  # numbers are recorded as-is instead of aborting the session.
+  echo "WARNING: could not read frequencies for all workload cores — homogeneity unverified, results carry that caveat."
+  WORKLOAD_FREQS[0]="unknown"
 fi
 
 MUON_FREQ=$(cpu_freq_khz "$MUON_CORE")
@@ -187,7 +294,12 @@ ENV_FILE="${RESULTS_FILE%.txt}.env"
   echo "cpu: $(lscpu 2>/dev/null | grep 'Model name' | sed 's/^[[:space:]]*//')"
   for gov_file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     [ -r "$gov_file" ] || continue
-    echo "governor $(basename "$(dirname "$(dirname "$gov_file")")"): $(cat "$gov_file" 2>/dev/null)"
+    gov_now=$(cat "$gov_file" 2>/dev/null)
+    gov_was="${SAVED_GOVERNORS["$gov_file"]:-unsaved}"
+    echo "governor $(basename "$(dirname "$(dirname "$gov_file")")"): now=$gov_now was=$gov_was"
+    if [ "$gov_now" != "performance" ]; then
+      echo "WARNING: governor lock to 'performance' did not take effect on $(basename "$(dirname "$(dirname "$gov_file")")") — timings suspect."
+    fi
   done
   if [ -r /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
     echo "turbo: intel_pstate/no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)"
@@ -239,38 +351,52 @@ check_power_supply() {
   fi
 }
 
-# Abort when any thermal zone is above 95°C so throttled numbers are never recorded.
+# Abort when a CPU thermal zone is above 95°C so throttled numbers are never
+# recorded. Prefers CPU/package/acpi zones; a GPU or NVMe sensor must not
+# veto a CPU run, but when no zone is identifiable all readable zones count.
 check_thermal() {
-  local max_temp=0 zone temp
+  local max_temp=0 zone temp ztype zd
+  local -a cpu_zones=()
+  local -a all_zones=()
   for zone in /sys/class/thermal/thermal_zone*/temp; do
     [ -r "$zone" ] || continue
     temp=$(cat "$zone" 2>/dev/null)
     [[ "$temp" =~ ^[0-9]+$ ]] || continue
+    all_zones+=("$temp")
+    zd=$(dirname "$zone")
+    ztype=$(cat "$zd/type" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    case "$ztype" in
+      *cpu*|*pkg*|*acpi*|*soc*|*core*) cpu_zones+=("$temp") ;;
+    esac
+  done
+
+  local -a use_zones=("${all_zones[@]}")
+  if [ "${#cpu_zones[@]}" -gt 0 ]; then
+    use_zones=("${cpu_zones[@]}")
+  fi
+  for temp in ${use_zones[@]+"${use_zones[@]}"}; do
     if [ "$temp" -gt "$max_temp" ]; then
       max_temp="$temp"
     fi
   done
 
   if [ "$max_temp" -gt 95000 ]; then
-    echo "ABORT: thermal zone at $((max_temp / 1000))°C (>95°C) — refusing to record throttled results." >&2
+    echo "ABORT: CPU thermal zone at $((max_temp / 1000))°C (>95°C) — refusing to record throttled results." >&2
     exit 1
   fi
 }
 
 check_power_supply
 
-# The exec workload drops privileges via sudo; with SUDO_USER empty every
-# exec run fails and the session would die at the first warmup. Fail here
-# with an actionable message instead.
-if [ -z "${SUDO_USER:-}" ]; then
-  echo "ABORT: SUDO_USER is empty — run via 'sudo ./benchmark_muon.sh ...' from your user account, not from a root shell." >&2
-  exit 1
-fi
-
 # =============================================================================
 # STATS HELPER
 # =============================================================================
 
+# Trimmed mean with sample standard deviation. The outer min/max are dropped
+# only when count>=4 (with 3 runs there is nothing safe to trim — trimming
+# would collapse stddev/min/max onto the median). sd uses n-1 (sample): the
+# runs are a sample of the machine's behavior, so population variance would
+# systematically understate run-to-run variability. Emits: mean stddev min max.
 calculate_stats() {
   local values=("$@")
   local count=${#values[@]}
@@ -281,7 +407,12 @@ calculate_stats() {
   fi
 
   local sorted=($(printf '%s\n' "${values[@]}" | sort -n))
-  local trimmed=("${sorted[@]:1:$((count - 2))}")
+  local trimmed
+  if [ "$count" -ge 4 ]; then
+    trimmed=("${sorted[@]:1:$((count - 2))}")
+  else
+    trimmed=("${sorted[@]}")
+  fi
 
   printf '%s\n' "${trimmed[@]}" | awk '{
     sum += $1;
@@ -292,9 +423,10 @@ calculate_stats() {
   } END {
     if (n > 0) {
       mean = sum / n;
-      variance = (sumsq / n) - (mean * mean);
-      if (variance < 0) variance = 0;
-      printf "%.3f %.3f %.3f %.3f", mean, sqrt(variance), tmin, tmax;
+      var_num = sumsq - sum * sum / n;
+      if (var_num < 0) var_num = 0;
+      sd = (n > 1) ? sqrt(var_num / (n - 1)) : 0;
+      printf "%.3f %.3f %.3f %.3f", mean, sd, tmin, tmax;
     } else {
       printf "0.000 0.000 0.000 0.000";
     }
@@ -335,7 +467,7 @@ declare -A CELL_RSS_MAX=()
 stop_muon() {
   local leader="$1"
   [ -n "$leader" ] || return 0
-  if command -v pkill >/dev/null 2>&1; then
+  if [[ "${PKILL_OK:-0}" -eq 1 ]]; then
     pkill -SIGTERM -P "$leader" 2>/dev/null
     local w
     for ((w=0; w<50; w++)); do
@@ -344,8 +476,24 @@ stop_muon() {
     done
   fi
   kill -SIGTERM -- "-$leader" 2>/dev/null
+  local w2
+  for ((w2=0; w2<10; w2++)); do
+    kill -0 "$leader" 2>/dev/null || break
+    sleep 0.1
+  done
+  # Escalate: a wedged tracer must never hang the session with probes
+  # attached. SIGKILL to the group, then reap the leader.
+  kill -SIGKILL -- "-$leader" 2>/dev/null
   wait "$leader" 2>/dev/null
+  rm -f "$LIVE_PGID_FILE"
   return 0
+}
+
+# Sanitize strings used in /tmp paths and CSV-adjacent contexts: map every
+# non-alphanumeric character (not just spaces) so a future name/tag with
+# '/', '..', '*' or ',' can neither escape /tmp nor shift CSV columns.
+safe_str() {
+  printf '%s' "$1" | tr -c '[:alnum:]_' '_'
 }
 
 # =============================================================================
@@ -372,8 +520,8 @@ single_run() {
   local workload="$4"
   local timed="$5"
   local tag="$6"
-  local safe_name="${name// /_}"
-  local safe_tag="${tag// /_}"
+  local safe_name="$(safe_str "$name")"
+  local safe_tag="$(safe_str "$tag")"
 
   sync
   echo 3 > /proc/sys/vm/drop_caches
@@ -388,23 +536,36 @@ single_run() {
     # process group so teardown can signal ALL of it: killing just $! would
     # take down `time` and orphan a still-tracing Muon on every run, leaking
     # tracers that contaminate later cells and defeat drop/event detection.
+    # The PGID file lets the session EXIT trap reap the pipeline if an
+    # external signal interrupts this run (cleared by stop_muon on every
+    # teardown path below).
     setsid taskset -c "$MUON_CORE" /usr/bin/time -v -o "$muon_res" $bg_cmd > "$muon_log" 2>&1 &
     muon_pid=$!
+    echo "$muon_pid" > "$LIVE_PGID_FILE"
   fi
 
-  sleep 1
-
+  # Muon can take a few seconds to attach on a loaded host; poll for the
+  # readiness line instead of sampling once, so one slow startup cannot
+  # abort the session (core cells) or silently drop the run.
   if [ -n "$muon_pid" ]; then
-    if ! kill -0 "$muon_pid" 2>/dev/null; then
-      echo "  $tag: FATAL — Muon exited before the run started:" >&2
-      tail -n 10 "$muon_log" | sed 's/^/    /' >&2
-      stop_muon "$muon_pid"
-      printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
-      rm -f "$muon_log"
-      return 1
-    fi
-    if ! grep -q "Muon ready" "$muon_log" 2>/dev/null; then
-      echo "  $tag: FATAL — Muon never reported ready:" >&2
+    local ready=0
+    local wready
+    for ((wready=0; wready<10; wready++)); do
+      if ! kill -0 "$muon_pid" 2>/dev/null; then
+        break
+      fi
+      if grep -q "Muon ready" "$muon_log" 2>/dev/null; then
+        ready=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$ready" -eq 0 ]; then
+      if ! kill -0 "$muon_pid" 2>/dev/null; then
+        echo "  $tag: FATAL — Muon exited before the run started:" >&2
+      else
+        echo "  $tag: FATAL — Muon never reported ready (10s):" >&2
+      fi
       tail -n 10 "$muon_log" | sed 's/^/    /' >&2
       stop_muon "$muon_pid"
       printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
@@ -464,10 +625,14 @@ single_run() {
       drop_warning=1
     fi
     # The last EVENTS: tally printed on shutdown is authoritative for this
-    # run; a missing line or total=0 means Muon observed nothing. The parsed
-    # total is also published to /tmp/muon_lastevents.txt (the caller runs in a
-    # subshell, so files are the communication channel). Non-Muon runs never
-    # reach this block and never touch the file.
+    # run: total = events accepted by the manager (parsed minus userspace
+    # drops, which are reported separately). A missing line or total=0 means
+    # Muon observed nothing. The parsed total is also published to
+    # /tmp/muon_lastevents.txt (the caller runs in a subshell, so files are
+    # the communication channel). Non-Muon runs never reach this block and
+    # never touch the file. Drop counts ride along in /tmp/muon_lastres.txt
+    # so the sweep can attribute drops even when the run's return code
+    # reflects a different failure (rc precedence).
     local last_events
     last_events=$(grep "EVENTS:" "$muon_log" 2>/dev/null | tail -n 1)
     if [[ "$last_events" =~ total=([0-9]+) ]]; then
@@ -476,6 +641,13 @@ single_run() {
     else
       printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
       zero_events=1
+    fi
+    if [[ "$last_events" =~ kernel_drops=([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+      printf 'MUON_DROPS=1\n' >> /tmp/muon_lastres.txt
+    elif [[ "$last_events" =~ userspace_drops=([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+      printf 'MUON_DROPS=1\n' >> /tmp/muon_lastres.txt
+    else
+      printf 'MUON_DROPS=0\n' >> /tmp/muon_lastres.txt
     fi
     rm -f "$muon_log"
   fi
@@ -521,7 +693,7 @@ warm_cell() {
   local bg_cmd="$3"
   local workload="$4"
   local category="$5"
-  local safe_name="${name// /_}"
+  local safe_name="$(safe_str "$name")"
   local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
 
   : > "$times_file"
@@ -531,11 +703,12 @@ warm_cell() {
 
   local w=0 warm_rc=0
   for ((w = 1; w <= WARMUP; w++)); do
+    check_thermal
     warm_rc=0
     single_run "$name" "$prefix_cmd" "$bg_cmd" "$workload" 0 "Warmup $w" || warm_rc=$?
     if [ "$warm_rc" -ne 0 ]; then
       echo ">> CELL FAILED: warmup $w/$WARMUP failed (rc=$warm_rc) for $name. <<" >&2
-      return 1
+      return $warm_rc
     fi
     echo "  Warmup $w/$WARMUP: complete (timing discarded)"
   done
@@ -553,7 +726,7 @@ timed_round() {
   local category="$5"
   local round="$6"
   local key="$category|$name"
-  local safe_name="${name// /_}"
+  local safe_name="$(safe_str "$name")"
   local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
 
   local run_out="" run_rc=0
@@ -601,17 +774,20 @@ timed_round() {
 #
 # CSV format v2 (10 comma-separated fields, one row per cell):
 #   category,name,avg,stddev,min,max,valid,dropped,muon_cpu_pct,muon_rss_kb
-# - avg/stddev: trimmed mean/stddev from calculate_stats (needs 3+ valid runs).
-# - min/max: trimmed min/max from calculate_stats (outer extremes dropped).
-# - muon_cpu_pct: mean Muon CPU% (1 decimal); empty for non-Muon cells.
-# - muon_rss_kb: peak Muon RSS in kbytes; empty for non-Muon cells.
+# - avg/stddev: trimmed mean and sample (n-1) stddev from calculate_stats
+#   (needs 3+ valid runs; the outer pair is trimmed only with 4+ runs).
+# - min/max: of the trimmed set when trimmed, raw extremes otherwise.
+# - muon_cpu_pct: mean Muon CPU% (1 decimal); empty for prefix-wrapped cells
+#   (strace/perf run in the foreground under plain `time`, so no resource
+#   figures exist for them) and when the report was unavailable.
+# - muon_rss_kb: peak Muon RSS in kbytes; empty under the same conditions.
 # - INVALID rows (<3 valid runs) keep the 10-field shape with zeroed stats:
 #   category,name,INVALID,0.000,0.000,0.000,valid,dropped,,
 finalize_cell() {
   local name="$1"
   local category="$2"
   local key="$category|$name"
-  local safe_name="${name// /_}"
+  local safe_name="$(safe_str "$name")"
   local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
   local dropped="${CELL_DROPPED[$key]:-0}"
 
@@ -727,6 +903,7 @@ run_gate() {
   echo " GATE: child-tracking (${gate_children} children)"
   echo "========================================="
 
+  check_thermal
   local gate_rc=0
   single_run "Gate" "" "$MUON_BIN attach -p $$ --headless" "$gate_workload" 0 "Gate" || gate_rc=$?
   if [ "$gate_rc" -ne 0 ]; then
@@ -772,6 +949,7 @@ run_sweep() {
 
   local sweep_best_rate=0 sweep_best_ops="" lvl r
   for lvl in "${levels[@]}"; do
+    check_thermal
     local sweep_bg="$MUON_BIN attach -p $$ --headless"
     local sweep_workload="stress-ng --open 4 --open-ops $lvl"
 
@@ -790,17 +968,22 @@ run_sweep() {
       local run_out="" run_rc=0
       run_out=$(single_run "Sweep $lvl" "" "$sweep_bg" "$sweep_workload" 1 "Sweep $lvl run $r") || run_rc=$?
 
-      local ev=""
+      local ev="" dropped="0"
       if [ -r /tmp/muon_lastevents.txt ]; then
         ev=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
+      fi
+      if [ -r /tmp/muon_lastres.txt ]; then
+        dropped=$(sed -n 's/^MUON_DROPS=//p' /tmp/muon_lastres.txt | tail -n 1)
       fi
 
       if [ "$run_rc" -eq 0 ]; then
         sweep_times+=("$run_out")
         valid=$((valid + 1))
         # Only timed or drop-marked runs contribute event counts; failed
-        # runs (rc 1/2/4) carry no meaningful tally.
+        # runs (rc 1/2/4/5) carry no meaningful tally. A run can be both
+        # timed AND drop-marked (drops with a valid wall time).
         [[ "$ev" =~ ^[0-9]+$ ]] && sweep_events+=("$ev")
+        [[ "$dropped" == "1" ]] && drops=$((drops + 1))
       elif [ "$run_rc" -eq 3 ]; then
         drops=$((drops + 1))
         [[ "$ev" =~ ^[0-9]+$ ]] && sweep_events+=("$ev")
@@ -819,10 +1002,13 @@ run_sweep() {
       ev_per_s=$(awk -v e="$mean_events" -v t="$avg_time" 'BEGIN { printf "%d", int(e / t) }')
     fi
 
-    if [ "$drops" -gt 0 ]; then
-      status="DROPS"
-    elif [ "$valid" -eq 3 ]; then
+    # CLEAN needs a full house with no drops; DROPS means backpressure was
+    # observed on an otherwise measured level; anything else is FAILED.
+    if [ "$valid" -eq 3 ] && [ "$drops" -eq 0 ]; then
       status="CLEAN"
+    elif [ "$drops" -gt 0 ] && [ "$valid" -gt 0 ]; then
+      status="DROPS"
+      any_drops=1
     fi
 
     echo "sweep: ops=$lvl avg=$avg_time events=$mean_events ev_per_s=$ev_per_s drops=$drops status=$status" >> "$RESULTS_FILE"
@@ -833,6 +1019,10 @@ run_sweep() {
       sweep_best_ops="$lvl"
     fi
   done
+
+  if [ "${any_drops:-0}" -eq 1 ]; then
+    echo "note: ev/s on DROPS rows is a lower bound — dropped events are uncounted by design."
+  fi
 
   if [ -n "$sweep_best_ops" ]; then
     echo "Max drop-free rate: ~$sweep_best_rate events/s at $sweep_best_ops openat ops"
@@ -890,7 +1080,10 @@ CELL_SPECS=(
 )
 run_category_rounds "${CELL_SPECS[@]}"
 
-# --- 4. MIXED (Regression) ---
+# --- 6. MIXED (disabled; kept as a template for a future combined workload) ---
+# NOTE: category number 6 is deliberate — 4 and 5 are taken by go-build and
+# kernel-compile above. Uncommenting this as-is yields PerEvent '-' (the
+# mixed op count is not a single number).
 # MIXED_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 2 --exec-ops $MIXED_EXEC_OPS --mmap 2 --mmap-mprotect --mmap-ops $MIXED_MMAP_OPS --open 2 --open-ops $MIXED_OPEN_OPS"
 # echo ""
 # echo "========================================="
@@ -1033,10 +1226,15 @@ else
       else if (cat == "open") ops = open_ops
       else if (cat == "mmap") ops = mmap_ops
       else ops = 0
-      if (ops > 0) per_event = sprintf("%.0f", (T - B) * 1e9 / ops)
+      # RULE MIRROR: overhead/err/verdict formulas are duplicated in
+      # bench/report.sh (render_markdown/render_json) and in the python
+      # comparison inside run_regress. Keep all three in sync.
+      # nz() kills negative zero ("-0", "-0.0%") from rounding tiny values.
+      if (ops > 0) per_event = nz(sprintf("%.0f", (T - B) * 1e9 / ops))
       else per_event = "-"
-      printf "%-12s %-20s %-12s %-10s %-13s %-10s\n", cat, $2, sprintf("%.1f%%", oh), sprintf("±%.1f%%", err), per_event, verdict
+      printf "%-12s %-20s %-12s %-10s %-13s %-10s\n", cat, $2, sprintf("%.1f%%", nz(oh)), sprintf("±%.1f%%", err), per_event, verdict
     }
+    function nz(x) { return (x == 0) ? 0 : x }
   ' "$RESULTS_FILE" "$RESULTS_FILE"
 fi
 
@@ -1052,21 +1250,24 @@ else
   echo "  overhead% = ((tracer_avg - baseline_avg) / baseline_avg) * 100"
   echo "  ±Err = 100 * sqrt((tracer_stddev / baseline_avg)^2 + (tracer_avg * baseline_stddev / baseline_avg^2)^2)"
   echo "  Verdict: NOISE when |tracer_avg - baseline_avg| < 2 * sqrt(tracer_stddev^2 + baseline_stddev^2), else REAL"
+  echo "  stddev is the sample (n-1) deviation of the trimmed runs."
+  echo "  Per-event ns divides by configured ops; stress-ng quantizes exec ops"
+  echo "  into fork batches (actual usually exceeds configured), so exec"
+  echo "  per-event figures are approximate — worse in --fast mode."
 fi
 echo ""
 
 # =============================================================================
 # ARCHIVE THIS RUN (results + env + metadata under bench/results/<stamp>)
 # =============================================================================
-CPU_TAG=$(lscpu 2>/dev/null | sed -n 's/^[[:space:]]*Model name:[[:space:]]*//p' | head -n 1 \
-  | sed -E 's/\((R|TM|r|tm)\)//g; s/\b(Intel|AMD|Core|CPU|Processor|Genuine)\b//gI' \
-  | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
-[ -n "$CPU_TAG" ] || CPU_TAG="unknown"
-STAMP="$(date +%Y%m%d-%H%M%S)-$(uname -r)-${CPU_TAG}"
 DEST="$SCRIPT_DIR/bench/results/$STAMP"
-mkdir -p "$DEST"
-[ -f "$RESULTS_FILE" ] && cp "$RESULTS_FILE" "$DEST/results.csv"
-[ -f "$ENV_FILE" ] && cp "$ENV_FILE" "$DEST/env.txt"
+mkdir -p "$DEST" 2>/dev/null || echo "WARNING: could not create archive dir $DEST." >&2
+if [ -f "$RESULTS_FILE" ]; then
+  cp "$RESULTS_FILE" "$DEST/results.csv" 2>/dev/null || echo "WARNING: could not archive results.csv." >&2
+fi
+if [ -f "$ENV_FILE" ]; then
+  cp "$ENV_FILE" "$DEST/env.txt" 2>/dev/null || echo "WARNING: could not archive env.txt." >&2
+fi
 {
   echo "date_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "mode: FAST=$FAST_MODE MUON_ONLY=$MUON_ONLY TRACERS_ONLY=$TRACERS_ONLY PUBLICATION=$PUBLICATION SWEEP=$SWEEP"
@@ -1078,6 +1279,7 @@ mkdir -p "$DEST"
   fi
 } > "$DEST/meta.txt"
 echo "Results archived to bench/results/$STAMP"
+ARCHIVED=1
 
 # =============================================================================
 # REGRESSION GATE (--regress[=warn|fail])
@@ -1120,8 +1322,17 @@ def main():
         print(f"REGRESS ERROR: cannot read baseline {baseline_path}: {exc}", file=sys.stderr)
         return 2
 
+    # Fail closed on wrong-shaped baselines (a list, a string cells map, a
+    # non-numeric capacity): comparing against garbage must never pass.
+    if not isinstance(baseline, dict) or not isinstance(baseline.get("cells", {}), dict):
+        print(f"REGRESS ERROR: baseline {baseline_path} has no object 'cells' map", file=sys.stderr)
+        return 2
+
     base_cells = baseline.get("cells") or {}
     base_cap = baseline.get("capacity_ev_per_s")
+    if base_cap is not None and (isinstance(base_cap, bool) or not isinstance(base_cap, (int, float))):
+        print(f"REGRESS ERROR: baseline capacity_ev_per_s is not a number", file=sys.stderr)
+        return 2
 
     base_rows = {}
     new_cells = {}
@@ -1165,12 +1376,20 @@ def main():
         print(f"REGRESS ERROR: cannot read results {csv_path}: {exc}", file=sys.stderr)
         return 2
 
+    # A null/missing stored overhead means "no baseline for this cell" (e.g.
+    # the baseline came from a partial run) — SKIP, never default to 0.0,
+    # which would manufacture a false FAIL against any real measurement.
     def baseline_oh_err(key):
-        cell = base_cells.get(key) or {}
+        cell = base_cells.get(key)
+        if not isinstance(cell, dict):
+            return None
+        oh, er = cell.get("overhead_pct"), cell.get("overhead_err")
+        if oh is None or er is None:
+            return None
         try:
-            return float(cell.get("overhead_pct", 0.0)), float(cell.get("overhead_err", 0.0))
+            return float(oh), float(er)
         except (TypeError, ValueError):
-            return 0.0, 0.0
+            return None
 
     rows = []
     notes = []
@@ -1193,7 +1412,12 @@ def main():
         B, Sb = base
         new_oh = (T - B) / B * 100.0
         new_err = 100.0 * math.sqrt((St / B) ** 2 + (T * Sb / (B * B)) ** 2)
-        base_oh, base_err = baseline_oh_err(key)
+        bo = baseline_oh_err(key)
+        if bo is None:
+            rows.append((key, None, new_oh, None, "SKIP"))
+            notes.append(f"REGRESS NOTE: {key} skipped — no stored overhead in baseline (partial baseline?)")
+            continue
+        base_oh, base_err = bo
         gap = new_oh - base_oh
         noise = 2.0 * math.sqrt(new_err ** 2 + base_err ** 2)
         # EPS keeps IEEE754 dust (e.g. 3.000000000000007) from flipping a
@@ -1201,8 +1425,12 @@ def main():
         EPS = 1e-9
 
         if gap > 3.0 + EPS and gap > noise:
-            verdict = "FAIL"
-            fails += 1
+            if mode == "fail":
+                verdict = "FAIL"
+                fails += 1
+            else:
+                verdict = "WARN"
+                warns += 1
         elif gap > 3.0 + EPS:
             verdict = "WARN"
             warns += 1
@@ -1215,8 +1443,11 @@ def main():
     for key in sorted(base_cells):
         if key in new_cells:
             continue
+        if key.split(":", 1)[-1] == "Baseline":
+            continue  # reference row, not a candidate — no note, no row
         state = "INVALID in this run" if key in invalid else "missing from this run"
-        rows.append((key, baseline_oh_err(key)[0], None, None, "SKIP"))
+        stored = baseline_oh_err(key)
+        rows.append((key, stored[0] if stored else None, None, None, "SKIP"))
         notes.append(f"REGRESS NOTE: {key} skipped ({state}; never fails)")
 
     print("")
@@ -1232,6 +1463,8 @@ def main():
         print(note)
 
     if sweep_best is not None and base_cap is not None:
+        # Boundary is exclusive and exact: integers on both sides, so exactly
+        # 80% passes. Advisory only — capacity never fails a run.
         if base_cap and sweep_best < 0.8 * base_cap:
             warns += 1
             print(f"REGRESS CAPACITY: WARN — CLEAN {sweep_best} events/s < 0.8 x baseline {base_cap} events/s")
@@ -1243,11 +1476,14 @@ def main():
         print("REGRESS CAPACITY: no CLEAN sweep in this run (info only)")
 
     if fails > 0:
-        if mode == "fail":
-            print(f"REGRESS FAIL ({fails})")
-            return 1
-        print(f"REGRESS WARN: {fails} cell(s) over the fail threshold — warn mode, not failing")
-    print(f"REGRESS PASS ({warns} warning(s))" if warns else "REGRESS PASS")
+        # fails can only be non-zero in fail mode (warn mode counts them as
+        # WARN above), so this is unconditionally a failure.
+        print(f"REGRESS FAIL ({fails})")
+        return 1
+    if warns > 0:
+        print(f"REGRESS PASS ({warns} warning(s))")
+    else:
+        print("REGRESS PASS")
     return 0
 
 
