@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -21,6 +22,7 @@ import (
 const allocEventSize = int(unsafe.Sizeof(AllocEventData{}))
 
 var manager = NewManager()
+var totalEventsSeen atomic.Uint64
 var batchChan = make(chan ParsedEventBatch, 64) // ~22MB worst case: 64 * 1024 * ~330B per event
 var eventPool = sync.Pool{
 	New: func() any {
@@ -29,6 +31,8 @@ var eventPool = sync.Pool{
 }
 
 func Monitor(targetPid uint32, p *tea.Program) {
+	totalEventsSeen.Store(0)
+
 	objs := loader.Load(targetPid)
 	defer objs.Close()
 
@@ -122,6 +126,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 
 				handler := handlers[header.Type]
 				handler(header, objs, parsedEvent, payload) // Passing slice instead of unsafe pointer
+				totalEventsSeen.Add(1)
 				currentBatch = append(currentBatch, parsedEvent)
 
 				if len(currentBatch) == BATCH_SIZE {
@@ -254,6 +259,9 @@ func Monitor(targetPid uint32, p *tea.Program) {
 	}
 	if d, u := manager.state.dropCount.Load(), manager.state.uspaceDrops.Load(); d != 0 || u != 0 {
 		log.Printf("WARNING: Ring buffer was full (kernel: %d, userspace: %d)", d, u)
+	}
+	if p == nil {
+		log.Printf("EVENTS: total=%d kernel_drops=%d userspace_drops=%d", totalEventsSeen.Load(), manager.state.dropCount.Load(), manager.state.uspaceDrops.Load())
 	}
 
 	log.Println("Exit successful.")
