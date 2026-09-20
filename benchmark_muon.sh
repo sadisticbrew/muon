@@ -20,12 +20,14 @@ MUON_CORE="0"
 # Dev mode vs Full mode
 FAST_MODE=0
 MUON_ONLY=0
+TRACERS_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST_MODE=1 ;;
     --muon-only) MUON_ONLY=1 ;;
+    --tracers-only) TRACERS_ONLY=1 ;;
     *)
-      echo "Unknown option: $arg (supported: --fast, --muon-only)"
+      echo "Unknown option: $arg (supported: --fast, --muon-only, --tracers-only)"
       exit 1
       ;;
   esac
@@ -64,6 +66,12 @@ fi
 if [[ "$MUON_ONLY" -eq 1 ]]; then
   RESULTS_FILE="/tmp/muon_bench_muon_only.txt"
   echo " MUON ONLY — baseline/strace/perf trace skipped, no overhead% in summary"
+fi
+
+# Tracers-only mode also keeps its own results file.
+if [[ "$TRACERS_ONLY" -eq 1 ]]; then
+  RESULTS_FILE="/tmp/muon_bench_tracers_only.txt"
+  echo " TRACERS ONLY — baseline and Muon skipped, no overhead% in summary"
 fi
 
 > "$RESULTS_FILE"
@@ -116,9 +124,14 @@ calculate_stats() {
 # =============================================================================
 
 # Wrapper: in muon-only mode, skip every tracer whose name isn't "Muon".
+# In tracers-only mode, skip Baseline and Muon.
 maybe_run() {
   if [[ "$MUON_ONLY" -eq 1 && "$1" != "Muon" ]]; then
     echo "  [muon-only] skipping $1"
+    return 0
+  fi
+  if [[ "$TRACERS_ONLY" -eq 1 && ( "$1" == "Baseline" || "$1" == "Muon" ) ]]; then
+    echo "  [tracers-only] skipping $1"
     return 0
   fi
   run_benchmark "$@"
@@ -240,8 +253,8 @@ echo "========================================="
 echo " CATEGORY 2: openat-heavy"
 echo "========================================="
 maybe_run "Baseline" "" "" "$OPEN_WORKLOAD" "open"
-# run_benchmark "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
-# run_benchmark "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
+maybe_run "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
+maybe_run "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
 maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$OPEN_WORKLOAD" "open"
 
 # --- 3. MMAP-heavy ---
@@ -285,6 +298,9 @@ done < "$RESULTS_FILE"
 echo ""
 if [[ "$MUON_ONLY" -eq 1 ]]; then
   echo "Muon-only mode: no baseline in this session."
+  echo "overhead% needs a full run: sudo ./benchmark_muon.sh [--fast]"
+elif [[ "$TRACERS_ONLY" -eq 1 ]]; then
+  echo "Tracers-only mode: no baseline in this session."
   echo "overhead% needs a full run: sudo ./benchmark_muon.sh [--fast]"
 else
   echo "Overhead calculation:"

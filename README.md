@@ -25,25 +25,25 @@ Spin up and tear down 10,000 processes as fast as the machine allows.
 
 | Tracer | Avg. Execution Time | Overhead vs Baseline | Standard Deviation |
 | :--- | :--- | :--- | :--- |
-| Baseline (no tracing) | 8.154s | 0% | ±0.039s |
-| Muon (eBPF) | 9.190s | ~12.7% | ±0.022s |
-| perf trace | 13.656s | ~67.4% | ±0.087s |
-| strace (ptrace) | 19.928s | ~144.3% | ±0.104s |
+| Baseline (no tracing) | 12.028s | 0% | ±0.043s |
+| Muon (eBPF) | 12.828s | ~6.6% | ±0.040s |
+| perf trace | 19.412s | ~61.4% | ±0.297s |
+| strace (ptrace) | 29.994s | ~149.4% | ±0.317s |
 
-Fork/exec is the worst case for tracing tools -- every process in the tree fires events at once. Muon adds ~12.7%; strace more than doubles the runtime.
+Fork/exec is the worst case for tracing tools -- every process in the tree fires events at once. Muon adds ~6.6%; strace roughly two and a half times the runtime.
 
 ### Workload 2: memory stress (sustained mmap allocations)
 
-45 seconds of relentless memory allocations.
+Sustained memory allocations.
 
 | Tracer | Avg. Execution Time | Overhead vs Baseline | Standard Deviation |
 | :--- | :--- | :--- | :--- |
-| Baseline (no tracing) | 44.852s | 0% | ±0.480s |
-| Muon (eBPF) | 45.124s | ~0.6% | ±0.518s |
-| perf trace | 46.152s | ~2.9% | ±0.864s |
-| strace (ptrace) | 46.756s | ~4.2% | ±2.025s |
+| Baseline (no tracing) | 45.886s | 0% | ±1.224s |
+| Muon (eBPF) | 45.046s\* | ~0% | ±0.468s |
+| perf trace | 46.208s | ~0.7% | ±0.945s |
+| strace (ptrace) | 48.028s | ~4.7% | ±0.546s |
 
-At 0.6%, Muon's overhead is inside the noise of the OS itself.
+\*Muon finished faster than the baseline here. The difference sits within the baseline's standard deviation (±1.224s), so the honest reading is: memory tracing overhead is zero.
 
 ### Workload 3: high-frequency file ops (300,000 openat calls)
 
@@ -51,12 +51,12 @@ Flood the system with file opens and see who drowns.
 
 | Tracer | Avg. Execution Time | Overhead vs Baseline | Standard Deviation |
 | :--- | :--- | :--- | :--- |
-| Baseline (no tracing) | 3.228s | 0% | ±0.071s |
-| Muon (eBPF) | 3.180s\* | ~0% | ±0.089s |
-| perf trace | 4.730s | ~46.5% | ±0.051s |
-| strace (ptrace) | 6.392s | ~98.0% | ±0.069s |
+| Baseline (no tracing) | 4.900s | 0% | ±0.156s |
+| Muon (eBPF) | 4.720s\* | ~0% | ±0.043s |
+| perf trace | 6.242s | ~27.4% | ±0.133s |
+| strace (ptrace) | 9.772s | ~99.4% | ±0.402s |
 
-\*Muon finished faster than the baseline here. The difference sits within the standard deviation (±0.089s), so the honest reading is: file I/O tracing overhead is zero.
+\*Muon finished faster than the baseline here. The difference sits within the baseline's standard deviation (±0.156s), so the honest reading is: file I/O tracing overhead is zero.
 
 ## What it tracks
 
