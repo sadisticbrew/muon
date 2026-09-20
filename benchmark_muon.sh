@@ -268,112 +268,335 @@ calculate_stats() {
 # CORE BENCHMARK FUNCTION
 # =============================================================================
 
-# Wrapper: in muon-only mode, skip every tracer whose name isn't "Muon".
-# In tracers-only mode, skip Baseline and Muon.
-maybe_run() {
+# Skip rules shared by every category: muon-only runs only "Muon";
+# tracers-only skips both "Baseline" and "Muon".
+cell_active() {
   if [[ "$MUON_ONLY" -eq 1 && "$1" != "Muon" ]]; then
-    echo "  [muon-only] skipping $1"
-    return 0
+    return 1
   fi
   if [[ "$TRACERS_ONLY" -eq 1 && ( "$1" == "Baseline" || "$1" == "Muon" ) ]]; then
-    echo "  [tracers-only] skipping $1"
-    return 0
+    return 1
   fi
-  run_benchmark "$@"
+  return 0
 }
 
-run_benchmark() {
+# Per-cell state keyed by "<category>|<name>". Wall times live in
+# /tmp/muon_cell_<category>_<safe_name>.times so interleaved rounds never lose
+# a measurement, and dropped counts survive across the round loop.
+declare -A CELL_DROPPED=()
+declare -A CELL_CPU_SUM=()
+declare -A CELL_CPU_COUNT=()
+declare -A CELL_RSS_MAX=()
+
+# =============================================================================
+# SINGLE RUN HELPER
+# =============================================================================
+
+# Executes one full iteration: drop caches, start Muon (if any), wait for
+# readiness, run the workload, stop Muon. In timed mode the measured wall time
+# is echoed on stdout; diagnostics always go to stderr.
+# Returns:
+#   0 = clean run
+#   1 = Muon failed to become ready (run dropped)
+#   2 = invalid timing output (run dropped)
+#   3 = ring buffer full warning (run dropped)
+#   4 = Muon ran but observed zero events (run dropped)
+# When bg_cmd is set, Muon runs under /usr/bin/time -v and its CPU%/max-RSS
+# are published via /tmp/muon_lastres.txt (a file, because callers invoke this
+# function inside a command-substitution subshell that cannot export vars).
+single_run() {
+  local name="$1"
+  local prefix_cmd="$2"
+  local bg_cmd="$3"
+  local workload="$4"
+  local timed="$5"
+  local tag="$6"
+  local safe_name="${name// /_}"
+  local safe_tag="${tag// /_}"
+
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+  sleep 0.5
+
+  local muon_pid=""
+  local muon_log="/tmp/muon_${safe_tag}.log"
+  local muon_res="/tmp/muon_res_${safe_tag}.txt"
+  if [ -n "$bg_cmd" ]; then
+    rm -f "$muon_res"
+    taskset -c "$MUON_CORE" /usr/bin/time -v -o "$muon_res" $bg_cmd > "$muon_log" 2>&1 &
+    muon_pid=$!
+  fi
+
+  sleep 1
+
+  if [ -n "$muon_pid" ]; then
+    if ! kill -0 "$muon_pid" 2>/dev/null; then
+      echo "  $tag: FATAL — Muon exited before the run started:" >&2
+      tail -n 10 "$muon_log" | sed 's/^/    /' >&2
+      kill "$muon_pid" 2>/dev/null
+      wait "$muon_pid" 2>/dev/null
+      rm -f "$muon_log"
+      return 1
+    fi
+    if ! grep -q "Muon ready" "$muon_log" 2>/dev/null; then
+      echo "  $tag: FATAL — Muon never reported ready:" >&2
+      tail -n 10 "$muon_log" | sed 's/^/    /' >&2
+      kill "$muon_pid" 2>/dev/null
+      wait "$muon_pid" 2>/dev/null
+      rm -f "$muon_log"
+      return 1
+    fi
+  fi
+
+  # /usr/bin/time reports %e into muon_time.txt via -o, while the workload's
+  # own stderr goes to a per-run file, so the two streams never mix. Clear the
+  # timing file first so a failed/missing time never leaves stale values.
+  rm -f /tmp/muon_time.txt
+  local workload_err="/tmp/muon_workload_err_${safe_name}_${safe_tag}.txt"
+  if [ -n "$prefix_cmd" ]; then
+    /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
+      taskset -c "$WORKLOAD_CORES" $prefix_cmd bash -c "$workload" \
+      2> "$workload_err"
+  else
+    /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
+      taskset -c "$WORKLOAD_CORES" bash -c "$workload" \
+      2> "$workload_err"
+  fi
+
+  local drop_warning=0
+  local zero_events=0
+  if [ -n "$muon_pid" ]; then
+    kill -SIGTERM "$muon_pid" > /dev/null 2>&1
+    wait "$muon_pid" 2>/dev/null
+
+    # Extract Muon's CPU%/max-RSS from /usr/bin/time -v. Missing or malformed
+    # fields simply become empty and never change this run's return code.
+    local muon_cpu="" muon_rss=""
+    if [ -r "$muon_res" ]; then
+      local cpu_line rss_line
+      cpu_line=$(grep -m1 'Percent of CPU this job got:' "$muon_res" 2>/dev/null)
+      rss_line=$(grep -m1 'Maximum resident set size (kbytes):' "$muon_res" 2>/dev/null)
+      cpu_line="${cpu_line##*: }"
+      cpu_line="${cpu_line%\%}"
+      rss_line="${rss_line##*: }"
+      [[ "$cpu_line" =~ ^[0-9]+$ ]] || cpu_line=""
+      [[ "$rss_line" =~ ^[0-9]+$ ]] || rss_line=""
+      muon_cpu="$cpu_line"
+      muon_rss="$rss_line"
+    fi
+    printf 'MUON_CPU=%s\nMUON_RSS=%s\n' "$muon_cpu" "$muon_rss" > /tmp/muon_lastres.txt
+
+    if grep -q "WARNING: Ring buffer was full" "$muon_log" 2>/dev/null; then
+      drop_warning=1
+    fi
+    # The last EVENTS: tally printed on shutdown is authoritative for this
+    # run; a missing line or total=0 means Muon observed nothing.
+    local last_events
+    last_events=$(grep "EVENTS:" "$muon_log" 2>/dev/null | tail -n 1)
+    if [[ "$last_events" =~ total=([0-9]+) ]]; then
+      [ "${BASH_REMATCH[1]}" -gt 0 ] || zero_events=1
+    else
+      zero_events=1
+    fi
+    rm -f "$muon_log"
+  fi
+
+  if [ "$zero_events" -eq 1 ]; then
+    return 4
+  fi
+
+  if [ "$timed" -eq 0 ]; then
+    return 0
+  fi
+
+  local run_time
+  run_time=$(tail -n 1 /tmp/muon_time.txt)
+  if [[ ! "$run_time" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "  $tag: FATAL — invalid timing output (dropping run):" >&2
+    sed 's/^/    /' /tmp/muon_time.txt >&2
+    return 2
+  fi
+
+  echo "$run_time"
+
+  if [ "$drop_warning" -eq 1 ]; then
+    return 3
+  fi
+
+  return 0
+}
+
+# Untimed warmup for one cell: WARMUP iterations via single_run, timing
+# discarded. A broken setup aborts the session immediately instead of burning
+# every remaining round. Also truncates the cell's times file so runs from an
+# earlier session can never bleed into this one.
+warm_cell() {
   local name="$1"
   local prefix_cmd="$2"
   local bg_cmd="$3"
   local workload="$4"
   local category="$5"
-  local times=()
-  local dropped_runs=0
+  local safe_name="${name// /_}"
+  local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
+
+  : > "$times_file"
 
   echo ""
   echo "--- $name ---"
 
-  for i in $(seq 1 $ITERATIONS); do
-    sync
-    echo 3 > /proc/sys/vm/drop_caches
-    sleep 0.5
-
-    local muon_pid=""
-    local muon_log="/tmp/muon_run_$i.log"
-    if [ -n "$bg_cmd" ]; then
-      taskset -c "$MUON_CORE" $bg_cmd > "$muon_log" 2>&1 &
-      muon_pid=$!
+  local w=0 warm_rc=0
+  for ((w = 1; w <= WARMUP; w++)); do
+    warm_rc=0
+    single_run "$name" "$prefix_cmd" "$bg_cmd" "$workload" 0 "Warmup $w" || warm_rc=$?
+    if [ "$warm_rc" -ne 0 ]; then
+      echo ">> ABORT: warmup $w/$WARMUP failed (rc=$warm_rc) for $name — setup is broken. <<" >&2
+      exit 1
     fi
-
-    sleep 1
-
-    local muon_ready=1
-    if [ -n "$muon_pid" ]; then
-      if ! kill -0 "$muon_pid" 2>/dev/null; then
-        echo "  Run $i: FATAL — Muon exited before the run started:"
-        tail -n 10 "$muon_log" | sed 's/^/    /'
-        muon_ready=0
-      elif ! grep -q "Muon ready" "$muon_log" 2>/dev/null; then
-        echo "  Run $i: FATAL — Muon never reported ready:"
-        tail -n 10 "$muon_log" | sed 's/^/    /'
-        muon_ready=0
-      fi
-      if [ "$muon_ready" -eq 0 ]; then
-        kill "$muon_pid" 2>/dev/null
-        wait "$muon_pid" 2>/dev/null
-        rm -f "$muon_log"
-        ((dropped_runs++))
-        continue
-      fi
-    fi
-
-    local time_output
-    if [ -n "$prefix_cmd" ]; then
-      time_output=$( { /usr/bin/time -f "%e" \
-        taskset -c "$WORKLOAD_CORES" $prefix_cmd bash -c "$workload" \
-        2>/tmp/muon_time.txt; } 2>/tmp/muon_time.txt; cat /tmp/muon_time.txt )
-    else
-      { /usr/bin/time -f "%e" \
-        taskset -c "$WORKLOAD_CORES" bash -c "$workload" \
-        2>/tmp/muon_time.txt; }
-      time_output=$(cat /tmp/muon_time.txt)
-    fi
-
-    local run_time=$(tail -n 1 /tmp/muon_time.txt)
-
-    local drop_warning=0
-    if [ -n "$muon_pid" ]; then
-      kill -SIGTERM "$muon_pid" > /dev/null 2>&1
-      wait "$muon_pid" 2>/dev/null
-      if grep -q "WARNING: Ring buffer was full" "$muon_log" 2>/dev/null; then
-        drop_warning=1
-      fi
-      rm -f "$muon_log"
-    fi
-
-    if [ "$drop_warning" -eq 1 ]; then
-      echo "  Run $i: ${run_time}s [DROPPED — ring buffer full]"
-      ((dropped_runs++))
-    else
-      echo "  Run $i: ${run_time}s"
-      times+=("$run_time")
-    fi
+    echo "  Warmup $w/$WARMUP: complete (timing discarded)"
   done
+}
 
+# One timed iteration for one cell inside the round-robin. A valid wall time is
+# appended to the cell's times file; any failure bumps the per-cell dropped
+# counter. After a clean Muon run the resource figures published by single_run
+# in /tmp/muon_lastres.txt are folded into the per-cell accumulators.
+timed_round() {
+  local name="$1"
+  local prefix_cmd="$2"
+  local bg_cmd="$3"
+  local workload="$4"
+  local category="$5"
+  local round="$6"
+  local key="$category|$name"
+  local safe_name="${name// /_}"
+  local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
+
+  local run_out="" run_rc=0
+  run_out=$(single_run "$name" "$prefix_cmd" "$bg_cmd" "$workload" 1 "Run $round") || run_rc=$?
+
+  if [ "$run_rc" -eq 3 ]; then
+    echo "  Run $round: ${run_out}s [DROPPED — ring buffer full]"
+    CELL_DROPPED["$key"]=$(( ${CELL_DROPPED["$key"]:-0} + 1 ))
+    return
+  fi
+  if [ "$run_rc" -ne 0 ]; then
+    CELL_DROPPED["$key"]=$(( ${CELL_DROPPED["$key"]:-0} + 1 ))
+    return
+  fi
+
+  echo "  Run $round: ${run_out}s"
+  echo "$run_out" >> "$times_file"
+
+  if [ -n "$bg_cmd" ]; then
+    local muon_cpu="" muon_rss=""
+    if [ -r /tmp/muon_lastres.txt ]; then
+      muon_cpu=$(sed -n 's/^MUON_CPU=//p' /tmp/muon_lastres.txt | tail -n 1)
+      muon_rss=$(sed -n 's/^MUON_RSS=//p' /tmp/muon_lastres.txt | tail -n 1)
+    fi
+    if [[ "$muon_cpu" =~ ^[0-9]+$ ]]; then
+      CELL_CPU_SUM["$key"]=$(( ${CELL_CPU_SUM["$key"]:-0} + muon_cpu ))
+      CELL_CPU_COUNT["$key"]=$(( ${CELL_CPU_COUNT["$key"]:-0} + 1 ))
+    fi
+    if [[ "$muon_rss" =~ ^[0-9]+$ ]]; then
+      if [ -z "${CELL_RSS_MAX["$key"]:-}" ] || [ "$muon_rss" -gt "${CELL_RSS_MAX["$key"]}" ]; then
+        CELL_RSS_MAX["$key"]="$muon_rss"
+      fi
+    fi
+  fi
+}
+
+# Reads a cell's times file, computes stats and appends exactly ONE CSV row.
+#
+# CSV format v2 (10 comma-separated fields, one row per cell):
+#   category,name,avg,stddev,min,max,valid,dropped,muon_cpu_pct,muon_rss_kb
+# - avg/stddev: trimmed mean/stddev from calculate_stats (needs 3+ valid runs).
+# - min/max: raw extremes of the valid runs (trimmed stats arrive next commit).
+# - muon_cpu_pct: mean Muon CPU% (1 decimal); empty for non-Muon cells.
+# - muon_rss_kb: peak Muon RSS in kbytes; empty for non-Muon cells.
+# - INVALID rows (<3 valid runs) keep the 10-field shape with zeroed stats:
+#   category,name,INVALID,0.000,0.000,0.000,valid,dropped,,
+finalize_cell() {
+  local name="$1"
+  local category="$2"
+  local key="$category|$name"
+  local safe_name="${name// /_}"
+  local times_file="/tmp/muon_cell_${category}_${safe_name}.times"
+  local dropped="${CELL_DROPPED[$key]:-0}"
+
+  local times=()
+  if [ -f "$times_file" ]; then
+    mapfile -t times < "$times_file"
+  fi
   local valid=${#times[@]}
+
   if [ "$valid" -lt 3 ]; then
     echo ">> INVALID: Only $valid clean runs (need 3+). <<"
-    echo "$category,$name,INVALID,0.000,$valid,$dropped_runs" >> "$RESULTS_FILE"
+    echo "$category,$name,INVALID,0.000,0.000,0.000,$valid,$dropped,," >> "$RESULTS_FILE"
     return
   fi
 
   local stats=($(calculate_stats "${times[@]}"))
   local avg=${stats[0]}
   local stddev=${stats[1]}
+  local min max
+  min=$(sort -n "$times_file" | head -n 1)
+  max=$(sort -n "$times_file" | tail -n 1)
 
-  echo ">> Average for $name: ${avg}s (±${stddev}s) | $valid clean runs, $dropped_runs dropped <<"
-  echo "$category,$name,$avg,$stddev,$valid,$dropped_runs" >> "$RESULTS_FILE"
+  local muon_cpu="" muon_rss=""
+  if [ "${CELL_CPU_COUNT[$key]:-0}" -gt 0 ]; then
+    muon_cpu=$(awk -v sum="${CELL_CPU_SUM[$key]}" -v n="${CELL_CPU_COUNT[$key]}" 'BEGIN { printf "%.1f", sum / n }')
+  fi
+  [ -n "${CELL_RSS_MAX[$key]:-}" ] && muon_rss="${CELL_RSS_MAX[$key]}"
+
+  echo ">> Average for $name: ${avg}s (±${stddev}s) | $valid clean runs, $dropped dropped <<"
+  echo "$category,$name,$avg,$stddev,$min,$max,$valid,$dropped,$muon_cpu,$muon_rss" >> "$RESULTS_FILE"
+}
+
+# Drives one category with interleaved rounds: warm every active cell once,
+# then alternate cells round by round so thermal drift is spread across all
+# tracers instead of biasing whichever ran last, then emit one CSV row per
+# cell. Cell specs are '|'-delimited — name|prefix_cmd|bg_cmd|workload|category
+# (no command field contains '|'; spaces are preserved).
+run_category_rounds() {
+  local -a cell_specs=("$@")
+  local spec name prefix_cmd bg_cmd workload category
+  local -a active_specs=()
+  local category_label=""
+
+  for spec in "${cell_specs[@]}"; do
+    IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
+    category_label="$category"
+    if cell_active "$name"; then
+      active_specs+=("$spec")
+    elif [ "$MUON_ONLY" -eq 1 ]; then
+      echo "  [muon-only] skipping $name"
+    else
+      echo "  [tracers-only] skipping $name"
+    fi
+  done
+
+  [ "${#active_specs[@]}" -eq 0 ] && return 0
+
+  for spec in "${active_specs[@]}"; do
+    IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
+    warm_cell "$name" "$prefix_cmd" "$bg_cmd" "$workload" "$category"
+  done
+
+  local r
+  for r in $(seq 1 $ITERATIONS); do
+    echo ""
+    echo "Round $r/$ITERATIONS [$category_label]"
+    for spec in "${active_specs[@]}"; do
+      IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
+      check_thermal
+      timed_round "$name" "$prefix_cmd" "$bg_cmd" "$workload" "$category" "$r"
+    done
+  done
+
+  for spec in "${active_specs[@]}"; do
+    IFS='|' read -r name prefix_cmd bg_cmd workload category <<< "$spec"
+    finalize_cell "$name" "$category"
+  done
 }
 
 # =============================================================================
@@ -386,10 +609,13 @@ echo ""
 echo "========================================="
 echo " CATEGORY 1: exec-heavy"
 echo "========================================="
-maybe_run "Baseline" "" "" "$EXEC_WORKLOAD" "exec"
-maybe_run "strace" "strace -f -e trace=execve,exit -o /dev/null" "" "$EXEC_WORKLOAD" "exec"
-maybe_run "perf trace" "perf trace -e execve,exit -o /dev/null --" "" "$EXEC_WORKLOAD" "exec"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$EXEC_WORKLOAD" "exec"
+CELL_SPECS=(
+  "Baseline|||$EXEC_WORKLOAD|exec"
+  "strace|strace -f -e trace=execve,exit -o /dev/null||$EXEC_WORKLOAD|exec"
+  "perf trace|perf trace -e execve,exit -o /dev/null --||$EXEC_WORKLOAD|exec"
+  "Muon||$MUON_BIN attach -p $$ --headless|$EXEC_WORKLOAD|exec"
+)
+run_category_rounds "${CELL_SPECS[@]}"
 
 # --- 2. OPEN-heavy ---
 OPEN_WORKLOAD="stress-ng --open 4 --open-ops $OPEN_OPS"
@@ -397,10 +623,13 @@ echo ""
 echo "========================================="
 echo " CATEGORY 2: openat-heavy"
 echo "========================================="
-maybe_run "Baseline" "" "" "$OPEN_WORKLOAD" "open"
-maybe_run "strace" "strace -f -e trace=openat -o /dev/null" "" "$OPEN_WORKLOAD" "open"
-maybe_run "perf trace" "perf trace -e openat -o /dev/null --" "" "$OPEN_WORKLOAD" "open"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$OPEN_WORKLOAD" "open"
+CELL_SPECS=(
+  "Baseline|||$OPEN_WORKLOAD|open"
+  "strace|strace -f -e trace=openat -o /dev/null||$OPEN_WORKLOAD|open"
+  "perf trace|perf trace -e openat -o /dev/null --||$OPEN_WORKLOAD|open"
+  "Muon||$MUON_BIN attach -p $$ --headless|$OPEN_WORKLOAD|open"
+)
+run_category_rounds "${CELL_SPECS[@]}"
 
 # --- 3. MMAP-heavy ---
 MMAP_WORKLOAD="stress-ng --mmap 4 --mmap-mprotect --mmap-bytes 4K --mmap-ops $MMAP_OPS"
@@ -408,10 +637,13 @@ echo ""
 echo "========================================="
 echo " CATEGORY 3: mmap-heavy"
 echo "========================================="
-maybe_run "Baseline" "" "" "$MMAP_WORKLOAD" "mmap"
-maybe_run "strace" "strace -f -e trace=mmap,brk,munmap -o /dev/null" "" "$MMAP_WORKLOAD" "mmap"
-maybe_run "perf trace" "perf trace -e mmap,brk,munmap -o /dev/null --" "" "$MMAP_WORKLOAD" "mmap"
-maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$MMAP_WORKLOAD" "mmap"
+CELL_SPECS=(
+  "Baseline|||$MMAP_WORKLOAD|mmap"
+  "strace|strace -f -e trace=mmap,brk,munmap -o /dev/null||$MMAP_WORKLOAD|mmap"
+  "perf trace|perf trace -e mmap,brk,munmap -o /dev/null --||$MMAP_WORKLOAD|mmap"
+  "Muon||$MUON_BIN attach -p $$ --headless|$MMAP_WORKLOAD|mmap"
+)
+run_category_rounds "${CELL_SPECS[@]}"
 
 # --- 4. MIXED (Regression) ---
 # MIXED_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 2 --exec-ops $MIXED_EXEC_OPS --mmap 2 --mmap-mprotect --mmap-ops $MIXED_MMAP_OPS --open 2 --open-ops $MIXED_OPEN_OPS"
@@ -419,10 +651,13 @@ maybe_run "Muon" "" "$MUON_BIN attach -p $$ --headless" "$MMAP_WORKLOAD" "mmap"
 # echo "========================================="
 # echo " CATEGORY 4: mixed (regression test)"
 # echo "========================================="
-# run_benchmark "Baseline" "" "" "$MIXED_WORKLOAD" "mixed"
-# run_benchmark "strace" "strace -f -e trace=execve,exit,openat,mmap,brk -o /dev/null" "" "$MIXED_WORKLOAD" "mixed"
-# run_benchmark "perf trace" "perf trace -e execve,exit,openat,mmap,brk -o /dev/null --" "" "$MIXED_WORKLOAD" "mixed"
-# run_benchmark "Muon" "" "$MUON_BIN attach -p $$ --headless" "$MIXED_WORKLOAD" "mixed"
+# CELL_SPECS=(
+#   "Baseline|||$MIXED_WORKLOAD|mixed"
+#   "strace|strace -f -e trace=execve,exit,openat,mmap,brk -o /dev/null||$MIXED_WORKLOAD|mixed"
+#   "perf trace|perf trace -e execve,exit,openat,mmap,brk -o /dev/null --||$MIXED_WORKLOAD|mixed"
+#   "Muon||$MUON_BIN attach -p $$ --headless|$MIXED_WORKLOAD|mixed"
+# )
+# run_category_rounds "${CELL_SPECS[@]}"
 
 # =============================================================================
 # SUMMARY
@@ -433,11 +668,12 @@ echo "================================================================="
 echo " RESULTS SUMMARY"
 echo "================================================================="
 echo ""
-printf "%-12s %-20s %-10s %-10s %-10s %-10s\n" "Category" "Tracer" "Avg(s)" "StdDev(s)" "CleanRuns" "Dropped"
-printf "%-12s %-20s %-10s %-10s %-10s %-10s\n" "--------" "------" "------" "---------" "---------" "-------"
+printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "Category" "Tracer" "Avg(s)" "StdDev(s)" "Min(s)" "Max(s)" "CleanRuns" "Dropped"
+printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "--------" "------" "------" "---------" "------" "------" "---------" "-------"
 
-while IFS=',' read -r category name avg stddev valid dropped; do
-  printf "%-12s %-20s %-10s %-10s %-10s %-10s\n" "$category" "$name" "$avg" "±$stddev" "$valid" "$dropped"
+while IFS=',' read -r category name avg stddev min max valid dropped muon_cpu muon_rss; do
+  [[ "$category" == coremap:* ]] && continue
+  printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "$category" "$name" "$avg" "±$stddev" "$min" "$max" "$valid" "$dropped"
 done < "$RESULTS_FILE"
 
 echo ""
