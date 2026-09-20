@@ -22,6 +22,10 @@ import (
 const allocEventSize = int(unsafe.Sizeof(AllocEventData{}))
 
 var manager = NewManager()
+
+// Events accepted by the manager worker (parsed from the ring buffer minus
+// batches dropped on a full batchChan). Single drain goroutine owns the
+// increments/decrements; headless shutdown reports it in the EVENTS tally.
 var totalEventsSeen atomic.Uint64
 var batchChan = make(chan ParsedEventBatch, 64) // ~22MB worst case: 64 * 1024 * ~330B per event
 var eventPool = sync.Pool{
@@ -82,6 +86,9 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							eventPool.Put(e)
 						}
 						manager.ReportUserspaceDrops(uint64(len(currentBatch)))
+						// Dropped here never reached the manager: take them
+						// back out so totalEventsSeen counts accepted events.
+						totalEventsSeen.Add(^uint64(len(currentBatch)))
 					}
 					currentBatch = make(ParsedEventBatch, 0, BATCH_SIZE)
 				}
@@ -138,6 +145,7 @@ func Monitor(targetPid uint32, p *tea.Program) {
 							eventPool.Put(e)
 						}
 						manager.ReportUserspaceDrops(uint64(len(currentBatch))) // Log the userspace drop
+						totalEventsSeen.Add(^uint64(len(currentBatch)))
 					}
 					currentBatch = make([]*ParsedEvent, 0, BATCH_SIZE)
 				}
