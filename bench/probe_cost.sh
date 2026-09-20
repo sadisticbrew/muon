@@ -3,6 +3,8 @@
 #
 # Standalone companion to benchmark_muon.sh: attaches Muon, runs a fixed
 # stress-ng open() load, then diffs bpftool run_cnt/run_time_ns across the load.
+# Attribution is by program id set: ids present after attach but absent before
+# are Muon's, so unrelated system BPF programs can never pollute the table.
 # The "after" snapshot is taken while still attached because cilium/ebpf
 # unloads the programs on exit; a post-teardown snapshot would show none.
 # Usage: sudo bench/probe_cost.sh
@@ -16,7 +18,7 @@ fail() { echo "probe_cost: $*" >&2; exit 1; }
 
 # --- preconditions -----------------------------------------------------------
 [ "$EUID" -eq 0 ] || fail "must run as root: sudo $0"
-for tool in bpftool taskset stress-ng python3; do
+for tool in bpftool taskset stress-ng python3 setsid; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
 done
 [ -x "$MUON_BIN" ] || fail "Muon binary not found: $MUON_BIN (run 'make build')"
@@ -28,6 +30,7 @@ ORIG_STATS="$(cat "$STATS_FILE")"
 WORKDIR="$(mktemp -d /tmp/muon_probe_cost.XXXXXX)" || fail "mktemp failed"
 LOG="$WORKDIR/muon_pc.log"
 BEFORE="$WORKDIR/before.json"
+MID="$WORKDIR/mid.json"
 AFTER="$WORKDIR/after.json"
 LEADER=""
 
@@ -86,9 +89,17 @@ if [ "$ready" -ne 1 ]; then
   fail "Muon failed to start"
 fi
 
+# Mid snapshot: program ids present here but absent from BEFORE are Muon's.
+# (An id present in both could theoretically have been recycled between the
+# snapshots; matching by id AND name below keeps that from attributing
+# another program's runs to Muon.)
+bpftool -j prog show > "$MID" || fail "bpftool prog show (mid) failed"
+
 # --- fixed load while attached -----------------------------------------------
+# A failed load invalidates the whole measurement: deltas near zero would
+# otherwise print as a clean-looking empty table with exit 0.
 taskset -c 4,5,6,7 stress-ng --open 4 --open-ops 200000 >/dev/null 2>&1 \
-  || echo "probe_cost: warning: stress-ng exited non-zero" >&2
+  || fail "stress-ng load failed (artifacts kept in $WORKDIR)"
 
 # Snapshot before stopping Muon: its programs are unloaded on exit.
 bpftool -j prog show > "$AFTER" || fail "bpftool prog show (after) failed"
@@ -96,25 +107,43 @@ stop_muon "$LEADER"
 LEADER=""
 
 # --- per-program deltas ------------------------------------------------------
-python3 - "$BEFORE" "$AFTER" <<'PY'
+python3 - "$BEFORE" "$MID" "$AFTER" <<'PY'
 import json, sys
 
 def load(path):
     with open(path) as fh:
-        return {p.get("id"): p for p in json.load(fh)}
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError(f"{path}: expected a JSON list from 'bpftool -j prog show'")
+    return {p.get("id"): p for p in data if isinstance(p, dict)}
 
-before, after = load(sys.argv[1]), load(sys.argv[2])
+def num(prog, key):
+    val = prog.get(key)
+    return val if isinstance(val, int) and not isinstance(val, bool) else 0
+
+before, mid, after = (load(p) for p in sys.argv[1:4])
+
+# Muon's programs are the ids that appear at attach time: fresh ids absent
+# from BEFORE, plus recycled ids whose name changed to a trace_* program
+# (Muon's C functions are all trace_*; bpftool truncates to 15 chars).
+# Deltas are mid→after (the load window); an id that vanished or changed
+# names again since is unattributable and skipped.
+muon_ids = {}
+for pid, prog in mid.items():
+    name = prog.get("name", "?")
+    if pid not in before:
+        muon_ids[pid] = name
+    elif before[pid].get("name") != name and isinstance(name, str) and name.startswith("trace_"):
+        muon_ids[pid] = name
 rows = []
-for pid, prog in after.items():
-    old = before.get(pid, {})
-    # Match by id AND name: ids can be recycled if an unrelated program
-    # unloaded and another loaded between the two snapshots.
-    if old.get("name") != prog.get("name"):
+for pid, name in muon_ids.items():
+    old, prog = mid.get(pid, {}), after.get(pid)
+    if prog is None or prog.get("name") != name:
         continue
-    runs = prog.get("run_cnt", 0) - old.get("run_cnt", 0)
-    ns = prog.get("run_time_ns", 0) - old.get("run_time_ns", 0)
+    runs = num(prog, "run_cnt") - num(old, "run_cnt")
+    ns = num(prog, "run_time_ns") - num(old, "run_time_ns")
     if runs > 0:
-        rows.append((prog.get("name", "?"), runs, ns))
+        rows.append((name, runs, ns))
 rows.sort(key=lambda r: r[2], reverse=True)
 
 print(f"{'NAME':<32} {'RUNS':>12} {'TOTAL_MS':>12} {'NS/RUN':>10}")
