@@ -98,7 +98,8 @@ fi
 # Drop stale per-run artifacts from any earlier session so no leftover
 # .times/.log/.txt file can ever bleed into this session's measurements.
 rm -f /tmp/muon_*.log /tmp/muon_res_*.txt /tmp/muon_workload_err_*.txt \
-  /tmp/muon_cell_*.times /tmp/muon_lastres.txt /tmp/muon_time.txt
+  /tmp/muon_cell_*.times /tmp/muon_lastres.txt /tmp/muon_time.txt \
+  /tmp/muon_lastevents.txt
 
 # Save each CPU's current governor so restore_governors() can put it back.
 declare -A SAVED_GOVERNORS=()
@@ -405,15 +406,26 @@ single_run() {
       drop_warning=1
     fi
     # The last EVENTS: tally printed on shutdown is authoritative for this
-    # run; a missing line or total=0 means Muon observed nothing.
+    # run; a missing line or total=0 means Muon observed nothing. The parsed
+    # total is also published to /tmp/muon_lastevents.txt (the caller runs in a
+    # subshell, so files are the communication channel). Non-Muon runs never
+    # reach this block and never touch the file.
     local last_events
     last_events=$(grep "EVENTS:" "$muon_log" 2>/dev/null | tail -n 1)
     if [[ "$last_events" =~ total=([0-9]+) ]]; then
+      printf 'MUON_EVENTS=%s\n' "${BASH_REMATCH[1]}" > /tmp/muon_lastevents.txt
       [ "${BASH_REMATCH[1]}" -gt 0 ] || zero_events=1
     else
+      printf 'MUON_EVENTS=\n' > /tmp/muon_lastevents.txt
       zero_events=1
     fi
     rm -f "$muon_log"
+  fi
+
+  if [ "$workload_rc" -ne 0 ]; then
+    echo "  $tag: FATAL — workload exited rc=$workload_rc (dropping run):" >&2
+    tail -n 5 "$workload_err" 2>/dev/null | sed 's/^/    /' >&2
+    return 5
   fi
 
   if [ "$zero_events" -eq 1 ]; then
@@ -614,8 +626,150 @@ run_category_rounds() {
 }
 
 # =============================================================================
+# SESSION GATE + CAPACITY SWEEP
+# =============================================================================
+
+# Functional child-tracking gate: one untimed Muon run whose workload spawns
+# GATE_CHILDREN short-lived children. Regression class caught: Muon attaches
+# and reports ready with non-zero events but stops following forked children,
+# so the children's exec/exit events silently vanish while the run still looks
+# healthy. Each child yields fork+exec+exit, so ~3K events are expected at
+# K=500; requiring >= K is the conservative floor.
+run_gate() {
+  if [[ "$TRACERS_ONLY" -eq 1 ]]; then
+    echo "GATE: skipping child-tracking smoke test (tracers-only mode — Muon is skipped)"
+    return 0
+  fi
+
+  local gate_children=500
+  [[ "$FAST_MODE" -eq 1 ]] && gate_children=100
+  local gate_workload="for ((i=0; i<${gate_children}; i++)); do /bin/true; done"
+
+  echo ""
+  echo "========================================="
+  echo " GATE: child-tracking (${gate_children} children)"
+  echo "========================================="
+
+  local gate_rc=0
+  single_run "Gate" "" "$MUON_BIN attach -p $$ --headless" "$gate_workload" 0 "Gate" || gate_rc=$?
+  if [ "$gate_rc" -ne 0 ]; then
+    echo "ABORT: gate setup failed (rc=$gate_rc)" >&2
+    exit 1
+  fi
+
+  local gate_events=""
+  if [ -r /tmp/muon_lastevents.txt ]; then
+    gate_events=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
+  fi
+  if [[ "$gate_events" =~ ^[0-9]+$ ]] && [ "$gate_events" -ge "$gate_children" ]; then
+    echo "GATE PASS: Muon observed $gate_events events from $gate_children spawned children"
+  else
+    echo "ABORT: GATE FAIL — expected >= $gate_children events from $gate_children spawned children, got ${gate_events:-none}" >&2
+    exit 1
+  fi
+}
+
+# --sweep capacity scan: for each openat level, one untimed prime plus three
+# timed runs call single_run directly (the sweep keeps its own accounting and
+# does not reuse timed_round/finalize). Wall time is taken only from rc 0 runs,
+# event totals from /tmp/muon_lastevents.txt after every run; rc 3 counts as a
+# drop and rc 1/2/4/5 as a failure.
+run_sweep() {
+  if [[ "$TRACERS_ONLY" -eq 1 ]]; then
+    echo "SWEEP: skipping capacity scan — tracers-only mode runs no Muon."
+    return 0
+  fi
+
+  local -a levels
+  if [[ "$FAST_MODE" -eq 1 ]]; then
+    levels=(10000 20000 50000)
+  else
+    levels=(50000 100000 200000 400000 800000)
+  fi
+
+  echo ""
+  echo "================================================================="
+  echo " SWEEP REPORT — Muon capacity scan (openat)"
+  echo "================================================================="
+  printf "%-10s %-10s %-10s %-12s %-7s %-8s\n" "Ops" "Avg(s)" "Events" "Events/s" "Drops" "Status"
+
+  local sweep_best_rate=0 sweep_best_ops="" lvl r
+  for lvl in "${levels[@]}"; do
+    local sweep_bg="$MUON_BIN attach -p $$ --headless"
+    local sweep_workload="stress-ng --open 4 --open-ops $lvl"
+
+    # Failed setup is failed setup: abort the session like a failed warmup.
+    local prime_rc=0
+    single_run "Sweep $lvl" "" "$sweep_bg" "$sweep_workload" 0 "Sweep $lvl prime" || prime_rc=$?
+    if [ "$prime_rc" -ne 0 ]; then
+      echo ">> ABORT: sweep prime failed (rc=$prime_rc) for ops=$lvl — setup is broken. <<" >&2
+      exit 1
+    fi
+
+    local -a sweep_times=()
+    local -a sweep_events=()
+    local drops=0 valid=0
+    for r in 1 2 3; do
+      local run_out="" run_rc=0
+      run_out=$(single_run "Sweep $lvl" "" "$sweep_bg" "$sweep_workload" 1 "Sweep $lvl run $r") || run_rc=$?
+
+      local ev=""
+      if [ -r /tmp/muon_lastevents.txt ]; then
+        ev=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
+      fi
+
+      if [ "$run_rc" -eq 0 ]; then
+        sweep_times+=("$run_out")
+        valid=$((valid + 1))
+        # Only timed or drop-marked runs contribute event counts; failed
+        # runs (rc 1/2/4) carry no meaningful tally.
+        [[ "$ev" =~ ^[0-9]+$ ]] && sweep_events+=("$ev")
+      elif [ "$run_rc" -eq 3 ]; then
+        drops=$((drops + 1))
+        [[ "$ev" =~ ^[0-9]+$ ]] && sweep_events+=("$ev")
+      fi
+      echo "  Sweep $lvl run $r/3: rc=$run_rc events=${ev:-n/a}"
+    done
+
+    local avg_time="0.000" mean_events="0" ev_per_s="0" status="FAILED"
+    if [ "${#sweep_times[@]}" -gt 0 ]; then
+      avg_time=$(printf '%s\n' "${sweep_times[@]}" | awk '{s+=$1} END {printf "%.3f", s/NR}')
+    fi
+    if [ "${#sweep_events[@]}" -gt 0 ]; then
+      mean_events=$(printf '%s\n' "${sweep_events[@]}" | awk '{s+=$1} END {printf "%.0f", s/NR}')
+    fi
+    if awk -v t="$avg_time" 'BEGIN { exit (t > 0) ? 0 : 1 }'; then
+      ev_per_s=$(awk -v e="$mean_events" -v t="$avg_time" 'BEGIN { printf "%d", int(e / t) }')
+    fi
+
+    if [ "$drops" -gt 0 ]; then
+      status="DROPS"
+    elif [ "$valid" -eq 3 ]; then
+      status="CLEAN"
+    fi
+
+    echo "sweep: ops=$lvl avg=$avg_time events=$mean_events ev_per_s=$ev_per_s drops=$drops status=$status" >> "$RESULTS_FILE"
+    printf "%-10s %-10s %-10s %-12s %-7s %-8s\n" "$lvl" "$avg_time" "$mean_events" "$ev_per_s" "$drops" "$status"
+
+    if [ "$status" = "CLEAN" ] && [ "$ev_per_s" -ge "$sweep_best_rate" ]; then
+      sweep_best_rate="$ev_per_s"
+      sweep_best_ops="$lvl"
+    fi
+  done
+
+  if [ -n "$sweep_best_ops" ]; then
+    echo "Max drop-free rate: ~$sweep_best_rate events/s at $sweep_best_ops openat ops"
+  else
+    echo "Max drop-free rate: none — Muon dropped at every level"
+  fi
+}
+
+# =============================================================================
 # WORKLOADS
 # =============================================================================
+
+# Run the child-tracking gate once, before any category measures anything.
+run_gate
 
 # --- 1. EXEC-heavy ---
 EXEC_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 4 --exec-ops $EXEC_OPS"
@@ -755,7 +909,7 @@ printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "Category"
 printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "--------" "------" "------" "---------" "------" "------" "---------" "-------" "--------" "-----------"
 
 while IFS=',' read -r category name avg stddev min max valid dropped muon_cpu muon_rss; do
-  [[ "$category" == coremap:* ]] && continue
+  [[ "$category" == coremap:* || "$category" == sweep:* ]] && continue
   [ -z "$muon_cpu" ] && muon_cpu="-"
   [ -z "$muon_rss" ] && muon_rss="-"
   printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "$category" "$name" "$avg" "±$stddev" "$min" "$max" "$valid" "$dropped" "$muon_cpu" "$muon_rss"
@@ -772,7 +926,7 @@ else
   printf "%-12s %-20s %-12s %-10s %-13s %-10s\n" "--------" "------" "---------" "-----" "------------" "-------"
   awk -F',' -v exec_ops="$EXEC_OPS" -v open_ops="$OPEN_OPS" -v mmap_ops="$MMAP_OPS" '
     FNR == NR {
-      if ($1 ~ /^coremap:/) next
+      if ($1 ~ /^coremap:/ || $1 ~ /^sweep:/) next
       if ($2 == "Baseline" && $3 != "INVALID") {
         base_avg[$1] = $3 + 0
         base_sd[$1] = $4 + 0
@@ -780,7 +934,7 @@ else
       }
       next
     }
-    $1 ~ /^coremap:/ { next }
+    $1 ~ /^coremap:/ || $1 ~ /^sweep:/ { next }
     $2 == "Baseline" { next }
     $3 == "INVALID" { next }
     {
