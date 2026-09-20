@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -20,7 +21,7 @@ import (
 const allocEventSize = int(unsafe.Sizeof(AllocEventData{}))
 
 var manager = NewManager()
-var batchChan = make(chan ParsedEventBatch, 1000) // ~86MB
+var batchChan = make(chan ParsedEventBatch, 64) // ~22MB worst case: 64 * 1024 * ~330B per event
 var eventPool = sync.Pool{
 	New: func() any {
 		return new(ParsedEvent)
@@ -83,7 +84,11 @@ func Monitor(targetPid uint32, p *tea.Program) {
 			default:
 				record, err := rd.Read()
 				if err != nil {
-					if err == ringbuf.ErrClosed {
+					// A Read blocked in epoll returns a wrapped os.ErrClosed —
+					// not the ringbuf.ErrClosed sentinel — when woken by
+					// rd.Close() at shutdown. Same for any error once ctx is
+					// canceled: shutdown, not a data-path failure.
+					if errors.Is(err, ringbuf.ErrClosed) || errors.Is(err, os.ErrClosed) || ctx.Err() != nil {
 						return
 					}
 					log.Printf("Error reading from ring buffer: %v", err)
