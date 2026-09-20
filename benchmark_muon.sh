@@ -241,7 +241,7 @@ calculate_stats() {
   local count=${#values[@]}
 
   if [ "$count" -lt 3 ]; then
-    echo "0.000 0.000"
+    echo "0.000 0.000 0.000 0.000"
     return 1
   fi
 
@@ -251,15 +251,17 @@ calculate_stats() {
   printf '%s\n' "${trimmed[@]}" | awk '{
     sum += $1;
     sumsq += ($1 * $1);
-    n++
+    n++;
+    if (n == 1 || $1 < tmin) tmin = $1;
+    if (n == 1 || $1 > tmax) tmax = $1;
   } END {
     if (n > 0) {
       mean = sum / n;
       variance = (sumsq / n) - (mean * mean);
       if (variance < 0) variance = 0;
-      printf "%.3f %.3f", mean, sqrt(variance);
+      printf "%.3f %.3f %.3f %.3f", mean, sqrt(variance), tmin, tmax;
     } else {
-      printf "0.000 0.000";
+      printf "0.000 0.000 0.000 0.000";
     }
   }'
 }
@@ -510,7 +512,7 @@ timed_round() {
 # CSV format v2 (10 comma-separated fields, one row per cell):
 #   category,name,avg,stddev,min,max,valid,dropped,muon_cpu_pct,muon_rss_kb
 # - avg/stddev: trimmed mean/stddev from calculate_stats (needs 3+ valid runs).
-# - min/max: raw extremes of the valid runs (trimmed stats arrive next commit).
+# - min/max: trimmed min/max from calculate_stats (outer extremes dropped).
 # - muon_cpu_pct: mean Muon CPU% (1 decimal); empty for non-Muon cells.
 # - muon_rss_kb: peak Muon RSS in kbytes; empty for non-Muon cells.
 # - INVALID rows (<3 valid runs) keep the 10-field shape with zeroed stats:
@@ -538,9 +540,8 @@ finalize_cell() {
   local stats=($(calculate_stats "${times[@]}"))
   local avg=${stats[0]}
   local stddev=${stats[1]}
-  local min max
-  min=$(sort -n "$times_file" | head -n 1)
-  max=$(sort -n "$times_file" | tail -n 1)
+  local min=${stats[2]}
+  local max=${stats[3]}
 
   local muon_cpu="" muon_rss=""
   if [ "${CELL_CPU_COUNT[$key]:-0}" -gt 0 ]; then
@@ -668,13 +669,63 @@ echo "================================================================="
 echo " RESULTS SUMMARY"
 echo "================================================================="
 echo ""
-printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "Category" "Tracer" "Avg(s)" "StdDev(s)" "Min(s)" "Max(s)" "CleanRuns" "Dropped"
-printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "--------" "------" "------" "---------" "------" "------" "---------" "-------"
+printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "Category" "Tracer" "Avg(s)" "StdDev(s)" "Min(s)" "Max(s)" "CleanRuns" "Dropped" "MuonCPU%" "MuonRSS(KB)"
+printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "--------" "------" "------" "---------" "------" "------" "---------" "-------" "--------" "-----------"
 
 while IFS=',' read -r category name avg stddev min max valid dropped muon_cpu muon_rss; do
   [[ "$category" == coremap:* ]] && continue
-  printf "%-12s %-20s %-10s %-10s %-10s %-10s %-10s %-10s\n" "$category" "$name" "$avg" "±$stddev" "$min" "$max" "$valid" "$dropped"
+  [ -z "$muon_cpu" ] && muon_cpu="-"
+  [ -z "$muon_rss" ] && muon_rss="-"
+  printf "%-12s %-20s %-10s %-11s %-10s %-10s %-10s %-9s %-10s %-11s\n" "$category" "$name" "$avg" "±$stddev" "$min" "$max" "$valid" "$dropped" "$muon_cpu" "$muon_rss"
 done < "$RESULTS_FILE"
+
+if [[ "$MUON_ONLY" -eq 1 || "$TRACERS_ONLY" -eq 1 ]]; then
+  echo "Derived overhead needs a full run with a Baseline cell."
+else
+  echo ""
+  echo "================================================================="
+  echo " OVERHEAD vs BASELINE"
+  echo "================================================================="
+  printf "%-12s %-20s %-12s %-10s %-13s %-10s\n" "Category" "Tracer" "Overhead%" "±Err" "PerEvent(ns)" "Verdict"
+  printf "%-12s %-20s %-12s %-10s %-13s %-10s\n" "--------" "------" "---------" "-----" "------------" "-------"
+  awk -F',' -v exec_ops="$EXEC_OPS" -v open_ops="$OPEN_OPS" -v mmap_ops="$MMAP_OPS" '
+    FNR == NR {
+      if ($1 ~ /^coremap:/) next
+      if ($2 == "Baseline" && $3 != "INVALID") {
+        base_avg[$1] = $3 + 0
+        base_sd[$1] = $4 + 0
+        have_base[$1] = 1
+      }
+      next
+    }
+    $1 ~ /^coremap:/ { next }
+    $2 == "Baseline" { next }
+    $3 == "INVALID" { next }
+    {
+      cat = $1
+      T = $3 + 0
+      St = $4 + 0
+      if (!have_base[cat] || base_avg[cat] == 0) {
+        printf "%-12s %-20s %-12s %-10s %-13s %-10s\n", cat, $2, "n/a", "n/a", "n/a", "n/a"
+        next
+      }
+      B = base_avg[cat]
+      Sb = base_sd[cat]
+      oh = (T - B) / B * 100
+      err = 100 * sqrt((St / B) ^ 2 + (T * Sb / (B * B)) ^ 2)
+      gap = T - B
+      if (gap < 0) gap = -gap
+      verdict = (gap < 2 * sqrt(St * St + Sb * Sb)) ? "NOISE" : "REAL"
+      if (cat == "exec") ops = exec_ops
+      else if (cat == "open") ops = open_ops
+      else if (cat == "mmap") ops = mmap_ops
+      else ops = 0
+      if (ops > 0) per_event = sprintf("%.0f", (T - B) * 1e9 / ops)
+      else per_event = "-"
+      printf "%-12s %-20s %-12s %-10s %-13s %-10s\n", cat, $2, sprintf("%.1f%%", oh), sprintf("±%.1f%%", err), per_event, verdict
+    }
+  ' "$RESULTS_FILE" "$RESULTS_FILE"
+fi
 
 echo ""
 if [[ "$MUON_ONLY" -eq 1 ]]; then
@@ -686,5 +737,7 @@ elif [[ "$TRACERS_ONLY" -eq 1 ]]; then
 else
   echo "Overhead calculation:"
   echo "  overhead% = ((tracer_avg - baseline_avg) / baseline_avg) * 100"
+  echo "  ±Err = 100 * sqrt((tracer_stddev / baseline_avg)^2 + (tracer_avg * baseline_stddev / baseline_avg^2)^2)"
+  echo "  Verdict: NOISE when |tracer_avg - baseline_avg| < 2 * sqrt(tracer_stddev^2 + baseline_stddev^2), else REAL"
 fi
 echo ""
