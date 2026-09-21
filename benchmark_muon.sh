@@ -924,11 +924,14 @@ run_gate() {
   fi
 }
 
-# --sweep capacity scan: for each openat level, one untimed prime plus three
-# timed runs call single_run directly (the sweep keeps its own accounting and
-# does not reuse timed_round/finalize). Wall time is taken only from rc 0 runs,
-# event totals from /tmp/muon_lastevents.txt after every run; rc 3 counts as a
-# drop and rc 1/2/4/5 as a failure.
+# --sweep capacity scan: for each brk worker level, one untimed prime plus
+# three timed runs call single_run directly (the sweep keeps its own
+# accounting and does not reuse timed_round/finalize). Levels scale WORKERS
+# at fixed ops — not ops at fixed workers — because only concurrent syscall
+# rate moves events/sec; scaling ops merely lengthens the run at a flat
+# rate. Wall time is taken only from rc 0 runs, event totals from
+# /tmp/muon_lastevents.txt after every run; rc 3 counts as a drop and
+# rc 1/2/4/5 as a failure.
 run_sweep() {
   if [[ "$TRACERS_ONLY" -eq 1 ]]; then
     echo "SWEEP: skipping capacity scan — tracers-only mode runs no Muon."
@@ -936,29 +939,32 @@ run_sweep() {
   fi
 
   local -a levels
+  local sweep_ops
   if [[ "$FAST_MODE" -eq 1 ]]; then
-    levels=(10000 20000 50000)
+    levels=(1 2 4)
+    sweep_ops=200000
   else
-    levels=(50000 100000 200000 400000 800000)
+    levels=(2 4 8 12)
+    sweep_ops=1000000
   fi
 
   echo ""
   echo "================================================================="
-  echo " SWEEP REPORT — Muon capacity scan (openat)"
+  echo " SWEEP REPORT — Muon capacity scan (brk workers)"
   echo "================================================================="
-  printf "%-10s %-10s %-10s %-12s %-7s %-8s\n" "Ops" "Avg(s)" "Events" "Events/s" "Drops" "Status"
+  printf "%-10s %-10s %-10s %-10s %-12s %-7s %-8s\n" "Workers" "Ops" "Avg(s)" "Events" "Events/s" "Drops" "Status"
 
-  local sweep_best_rate=0 sweep_best_ops="" lvl r
+  local sweep_best_rate=0 sweep_best_workers="" lvl r
   for lvl in "${levels[@]}"; do
     check_thermal
     local sweep_bg="$MUON_BIN attach -p $$ --headless"
-    local sweep_workload="stress-ng --open 4 --open-ops $lvl"
+    local sweep_workload="stress-ng --brk $lvl --brk-ops $sweep_ops --metrics-brief"
 
     # Failed setup is failed setup: abort the session like a failed warmup.
     local prime_rc=0
-    single_run "Sweep $lvl" "" "$sweep_bg" "$sweep_workload" 0 "Sweep $lvl prime" || prime_rc=$?
+    single_run "Sweep brk$lvl" "" "$sweep_bg" "$sweep_workload" 0 "Sweep brk$lvl prime" || prime_rc=$?
     if [ "$prime_rc" -ne 0 ]; then
-      echo ">> ABORT: sweep prime failed (rc=$prime_rc) for ops=$lvl — setup is broken. <<" >&2
+      echo ">> ABORT: sweep prime failed (rc=$prime_rc) for workers=$lvl — setup is broken. <<" >&2
       exit 1
     fi
 
@@ -967,7 +973,7 @@ run_sweep() {
     local drops=0 valid=0
     for r in 1 2 3; do
       local run_out="" run_rc=0
-      run_out=$(single_run "Sweep $lvl" "" "$sweep_bg" "$sweep_workload" 1 "Sweep $lvl run $r") || run_rc=$?
+      run_out=$(single_run "Sweep brk$lvl" "" "$sweep_bg" "$sweep_workload" 1 "Sweep brk$lvl run $r") || run_rc=$?
 
       local ev="" dropped="0"
       if [ -r /tmp/muon_lastevents.txt ]; then
@@ -989,7 +995,7 @@ run_sweep() {
         drops=$((drops + 1))
         [[ "$ev" =~ ^[0-9]+$ ]] && sweep_events+=("$ev")
       fi
-      echo "  Sweep $lvl run $r/3: rc=$run_rc events=${ev:-n/a}"
+      echo "  Sweep brk$lvl run $r/3: rc=$run_rc events=${ev:-n/a}"
     done
 
     local avg_time="0.000" mean_events="0" ev_per_s="0" status="FAILED"
@@ -1012,12 +1018,12 @@ run_sweep() {
       any_drops=1
     fi
 
-    echo "sweep: ops=$lvl avg=$avg_time events=$mean_events ev_per_s=$ev_per_s drops=$drops status=$status" >> "$RESULTS_FILE"
-    printf "%-10s %-10s %-10s %-12s %-7s %-8s\n" "$lvl" "$avg_time" "$mean_events" "$ev_per_s" "$drops" "$status"
+    echo "sweep: ops=$sweep_ops workers=$lvl avg=$avg_time events=$mean_events ev_per_s=$ev_per_s drops=$drops status=$status" >> "$RESULTS_FILE"
+    printf "%-10s %-10s %-10s %-10s %-12s %-7s %-8s\n" "$lvl" "$sweep_ops" "$avg_time" "$mean_events" "$ev_per_s" "$drops" "$status"
 
     if [ "$status" = "CLEAN" ] && [ "$ev_per_s" -ge "$sweep_best_rate" ]; then
       sweep_best_rate="$ev_per_s"
-      sweep_best_ops="$lvl"
+      sweep_best_workers="$lvl"
     fi
   done
 
@@ -1025,8 +1031,8 @@ run_sweep() {
     echo "note: ev/s on DROPS rows is a lower bound — dropped events are uncounted by design."
   fi
 
-  if [ -n "$sweep_best_ops" ]; then
-    echo "Max drop-free rate: ~$sweep_best_rate events/s at $sweep_best_ops openat ops"
+  if [ -n "$sweep_best_workers" ]; then
+    echo "Max drop-free rate: ~$sweep_best_rate events/s at $sweep_best_workers brk workers ($sweep_ops ops)"
   else
     echo "Max drop-free rate: none — Muon dropped at every level"
   fi
@@ -1038,6 +1044,66 @@ run_sweep() {
 
 # Run the child-tracking gate once, before any category measures anything.
 run_gate
+
+# Map-limit probe: hold more live children than tracked_pids has entries
+# (16384) to prove overflow behavior, then reap them all (exit storm).
+# Muon-only and untimed — this is a functional limit probe, not a timing
+# comparison (strace would take forever on 18k forks). Drops are tolerated
+# and reported: the assertions are completion + substantial observed events.
+run_maptest() {
+  if [[ "$TRACERS_ONLY" -eq 1 ]]; then
+    echo "MAPTEST: skipping (tracers-only mode — Muon is skipped)"
+    return 0
+  fi
+
+  local map_children=18000 map_need_kb=6291456 map_need_proc=25000 map_floor=25000
+  if [[ "$FAST_MODE" -eq 1 ]]; then
+    map_children=3000; map_need_kb=2097152; map_need_proc=5000; map_floor=4000
+  fi
+
+  local mem_kb
+  mem_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
+  if [[ ! "$mem_kb" =~ ^[0-9]+$ ]] || [ "$mem_kb" -lt "$map_need_kb" ]; then
+    echo "MAPTEST: skipping — need ${map_need_kb}kB available RAM for $map_children concurrent children (have ${mem_kb:-unknown}kB)."
+    return 0
+  fi
+  local max_proc
+  max_proc=$(ulimit -u)
+  if [[ ! "$max_proc" =~ ^[0-9]+$ ]] || [ "$max_proc" -lt "$map_need_proc" ]; then
+    echo "MAPTEST: skipping — need nproc >= $map_need_proc for $map_children concurrent children (have ${max_proc:-unknown})."
+    return 0
+  fi
+
+  echo ""
+  echo "========================================="
+  echo " MAPTEST: $map_children concurrent children (map holds 16384)"
+  echo "========================================="
+
+  check_thermal
+  local map_workload="for i in \$(seq 1 $map_children); do sleep 300 & done; jobs -p | xargs -r kill 2>/dev/null; wait; true"
+  local map_rc=0
+  single_run "Maptest" "" "$MUON_BIN attach -p $$ --headless" "$map_workload" 0 "Maptest" || map_rc=$?
+  if [ "$map_rc" -ne 0 ] && [ "$map_rc" -ne 3 ]; then
+    echo "ABORT: maptest setup failed (rc=$map_rc)" >&2
+    exit 1
+  fi
+
+  local map_events="" map_drops=""
+  if [ -r /tmp/muon_lastevents.txt ]; then
+    map_events=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
+  fi
+  if [ -r /tmp/muon_lastres.txt ]; then
+    map_drops=$(sed -n 's/^MUON_DROPS=//p' /tmp/muon_lastres.txt | tail -n 1)
+  fi
+  if [[ "$map_events" =~ ^[0-9]+$ ]] && [ "$map_events" -ge "$map_floor" ]; then
+    echo "MAPTEST PASS: Muon observed $map_events events across $map_children spawned-and-reaped children (drops seen: ${map_drops:-0})"
+  else
+    echo "ABORT: MAPTEST FAIL — expected >= $map_floor events, got ${map_events:-none}" >&2
+    exit 1
+  fi
+}
+
+run_maptest
 
 # --- 1. EXEC-heavy ---
 EXEC_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 4 --exec-ops $EXEC_OPS"
