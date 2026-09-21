@@ -64,6 +64,9 @@ if [[ "$FAST_MODE" -eq 1 ]]; then
     EXEC_OPS=1000
     OPEN_OPS=100000
     MMAP_OPS=1000
+    BRK_OPS=200000
+    CONN_OPS=50000
+    PTHREAD_OPS=5000
 
     # Mixed mode needs specific ops per stressor
     MIXED_EXEC_OPS=200
@@ -80,6 +83,9 @@ else
     EXEC_OPS=10000
     OPEN_OPS=300000
     MMAP_OPS=15000
+    BRK_OPS=1000000
+    CONN_OPS=300000
+    PTHREAD_OPS=20000
 
     MIXED_EXEC_OPS=2000
     MIXED_OPEN_OPS=100000
@@ -148,16 +154,13 @@ require_tool() {
   done
 }
 [ -x /usr/bin/time ] || { echo "ABORT: /usr/bin/time missing (need GNU time for resource accounting)." >&2; exit 1; }
-require_tool "setsid taskset awk sort grep flock id"
+require_tool "setsid taskset awk sort grep flock id python3"
 require_tool "stress-ng"
 if [[ "$MUON_ONLY" -eq 0 ]]; then
   require_tool "strace perf"
 fi
 if [[ "$PUBLICATION" -eq 1 ]]; then
   require_tool "make"
-fi
-if [[ "$REGRESS" != "off" ]]; then
-  require_tool "python3"
 fi
 if command -v pkill >/dev/null 2>&1; then
   PKILL_OK=1
@@ -579,23 +582,21 @@ single_run() {
   # timing file first so a failed/missing time never leaves stale values.
   rm -f /tmp/muon_time.txt
   local workload_err="/tmp/muon_workload_err_${safe_name}_${safe_tag}.txt"
-  # Workload stdout is discarded: it would otherwise flow into this function's
-  # stdout and contaminate the caller's $(...) capture (stress-ng prints its
-  # own summary to stdout). Timing comes from muon_time.txt, diagnostics from
-  # the stderr file — stdout is needed by nothing.
-  # /usr/bin/time propagates the workload's exit status, so a silently
-  # failing workload (bad flags, missing binary, OOM) can never masquerade
-  # as a fast valid run.
+  # Workload stdout AND stderr both go to the per-run file: stdout must not
+  # flow into this function's stdout (it would contaminate the caller's
+  # $(...) capture — stress-ng prints its own summary to stdout), and the
+  # file preserves --metrics-brief actuals for debugging and exact op counts.
+  # Timing comes only from muon_time.txt; nothing here touches the capture.
   local workload_rc=0
   if [ -n "$prefix_cmd" ]; then
     /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
       taskset -c "$WORKLOAD_CORES" $prefix_cmd bash -c "$workload" \
-      >/dev/null 2> "$workload_err"
+      >>"$workload_err" 2>&1
     workload_rc=$?
   else
     /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
       taskset -c "$WORKLOAD_CORES" bash -c "$workload" \
-      >/dev/null 2> "$workload_err"
+      >>"$workload_err" 2>&1
     workload_rc=$?
   fi
 
@@ -1161,6 +1162,59 @@ else
   echo "  [publication-skip] kernel-compile requires --publication"
 fi
 
+# --- 6. brk-heavy ---
+# A bare-syscall loop: ~400k+ bogo ops/s, each firing enter+exit probes, so
+# this is the highest sustained event rate in the suite (~1M EPS) and the
+# first workload that genuinely pressures the ring buffer. --metrics-brief
+# actuals land in the per-run file (stdout is preserved there, not discarded).
+BRK_WORKLOAD="stress-ng --brk 4 --brk-ops $BRK_OPS --metrics-brief"
+echo ""
+echo "========================================="
+echo " CATEGORY 6: brk-heavy"
+echo "========================================="
+CELL_SPECS=(
+  "Baseline|||$BRK_WORKLOAD|brk"
+  "strace|strace -f -e trace=brk -o /dev/null||$BRK_WORKLOAD|brk"
+  "perf trace|perf trace -e brk -o /dev/null --||$BRK_WORKLOAD|brk"
+  "Muon||$MUON_BIN attach -p $$ --headless|$BRK_WORKLOAD|brk"
+)
+run_category_rounds "${CELL_SPECS[@]}"
+
+# --- 7. connect-heavy ---
+# Unix-socket connect flood via bench/conn_flood.py (self-contained, no
+# listener setup needed): ~100k connects/s single-threaded, one enter event
+# each, exercising the connect probe — including its Unix-socket path —
+# for the first time. No port exhaustion, no TIME_WAIT backlog.
+CONN_WORKLOAD="rm -f /tmp/muon_conn_test.sock; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py server \$(( $CONN_OPS + 60 )) & SRV=\$!; sleep 0.5; for i in \$(seq 1 50); do python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client 1 >/dev/null 2>&1 && break; sleep 0.1; done; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client $CONN_OPS; RC=\$?; kill -KILL \$SRV 2>/dev/null; wait \$SRV 2>/dev/null; rm -f /tmp/muon_conn_test.sock; exit \$RC"
+echo ""
+echo "========================================="
+echo " CATEGORY 7: connect-heavy"
+echo "========================================="
+CELL_SPECS=(
+  "Baseline|||$CONN_WORKLOAD|connect"
+  "strace|strace -f -e trace=connect -o /dev/null||$CONN_WORKLOAD|connect"
+  "perf trace|perf trace -e connect -o /dev/null --||$CONN_WORKLOAD|connect"
+  "Muon||$MUON_BIN attach -p $$ --headless|$CONN_WORKLOAD|connect"
+)
+run_category_rounds "${CELL_SPECS[@]}"
+
+# --- 8. pthread-churn ---
+# Rapid thread create/join: exercises the fork probe's thread path (the K1
+# TID surface) plus map insert/delete churn at ~60k ops/s. strace is
+# deliberately excluded — ptrace thread-following slows this workload ~50x
+# and the comparison adds no information; perf (tracepoints) stays.
+PTHREAD_WORKLOAD="stress-ng --pthread 4 --pthread-ops $PTHREAD_OPS"
+echo ""
+echo "========================================="
+echo " CATEGORY 8: pthread-churn"
+echo "========================================="
+CELL_SPECS=(
+  "Baseline|||$PTHREAD_WORKLOAD|pthread"
+  "perf trace|perf trace -e clone,clone3 -o /dev/null --||$PTHREAD_WORKLOAD|pthread"
+  "Muon||$MUON_BIN attach -p $$ --headless|$PTHREAD_WORKLOAD|pthread"
+)
+run_category_rounds "${CELL_SPECS[@]}"
+
 # --- Capacity sweep (--sweep only) ---
 if [[ "$SWEEP" -eq 1 ]]; then
   run_sweep
@@ -1194,7 +1248,7 @@ else
   echo "================================================================="
   printf "%-12s %-20s %-12s %-10s %-13s %-10s\n" "Category" "Tracer" "Overhead%" "±Err" "PerEvent(ns)" "Verdict"
   printf "%-12s %-20s %-12s %-10s %-13s %-10s\n" "--------" "------" "---------" "-----" "------------" "-------"
-  awk -F',' -v exec_ops="$EXEC_OPS" -v open_ops="$OPEN_OPS" -v mmap_ops="$MMAP_OPS" '
+  awk -F',' -v exec_ops="$EXEC_OPS" -v open_ops="$OPEN_OPS" -v mmap_ops="$MMAP_OPS" -v brk_ops="$BRK_OPS" -v conn_ops="$CONN_OPS" -v pthread_ops="$PTHREAD_OPS" '
     FNR == NR {
       if ($1 ~ /^coremap:/ || $1 ~ /^sweep:/) next
       if ($2 == "Baseline" && $3 != "INVALID") {
