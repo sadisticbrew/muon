@@ -1341,10 +1341,13 @@ else
       err = 100 * sqrt((St / B) ^ 2 + (T * Sb / (B * B)) ^ 2)
       gap = T - B
       if (gap < 0) gap = -gap
-      verdict = (gap < 2 * sqrt(St * St + Sb * Sb)) ? "NOISE" : "REAL"
+      verdict = (gap <= 2 * sqrt(St * St + Sb * Sb)) ? "NOISE" : "REAL"
       if (cat == "exec") ops = exec_ops
       else if (cat == "open") ops = open_ops
       else if (cat == "mmap") ops = mmap_ops
+      else if (cat == "brk") ops = brk_ops
+      else if (cat == "connect") ops = conn_ops
+      else if (cat == "pthread") ops = pthread_ops
       else ops = 0
       # RULE MIRROR: overhead/err/verdict formulas are duplicated in
       # bench/report.sh (render_markdown/render_json) and in the python
@@ -1369,7 +1372,7 @@ else
   echo "Overhead calculation:"
   echo "  overhead% = ((tracer_avg - baseline_avg) / baseline_avg) * 100"
   echo "  ±Err = 100 * sqrt((tracer_stddev / baseline_avg)^2 + (tracer_avg * baseline_stddev / baseline_avg^2)^2)"
-  echo "  Verdict: NOISE when |tracer_avg - baseline_avg| < 2 * sqrt(tracer_stddev^2 + baseline_stddev^2), else REAL"
+  echo "  Verdict: NOISE when |tracer_avg - baseline_avg| <= 2 * sqrt(tracer_stddev^2 + baseline_stddev^2), else REAL"
   echo "  stddev is the sample (n-1) deviation of the trimmed runs."
   echo "  Per-event ns divides by configured ops; stress-ng quantizes exec ops"
   echo "  into fork batches (actual usually exceeds configured), so exec"

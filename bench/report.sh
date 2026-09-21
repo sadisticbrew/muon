@@ -143,7 +143,7 @@ render_markdown() {
       oh = (avg - B) / B * 100
       err = 100 * sqrt((sd / B) ^ 2 + (avg * Sb / (B * B)) ^ 2)
       gap = avg - B; if (gap < 0) gap = -gap
-      verdict = (gap < 2 * sqrt(sd * sd + Sb * Sb)) ? "NOISE" : "REAL"
+      verdict = (gap <= 2 * sqrt(sd * sd + Sb * Sb)) ? "NOISE" : "REAL"
       if (verdict == "NOISE") {
         noise[nnoise++] = "\\*within noise — no measurable overhead (" name ")"
         verdict = "NOISE*"
