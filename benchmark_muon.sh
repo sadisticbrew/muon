@@ -16,6 +16,12 @@ RESULTS_FILE="/tmp/muon_bench_results.txt"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
 
+# Shared helpers (require_tool, safe_str, tally, stop_muon).
+LIB_SH="$SCRIPT_DIR/bench/lib.sh"
+[ -f "$LIB_SH" ] || { echo "ABORT: $LIB_SH missing." >&2; exit 1; }
+# shellcheck disable=SC1091
+. "$LIB_SH"
+
 # Session stamp, computed once up front so both the normal archive and the
 # abort-path preservation in session_cleanup use the same directory name.
 CPU_TAG=$(lscpu 2>/dev/null | sed -n 's/^[[:space:]]*Model name:[[:space:]]*//p' | head -n 1 \
@@ -68,11 +74,6 @@ if [[ "$FAST_MODE" -eq 1 ]]; then
     CONN_OPS=50000
     PTHREAD_OPS=5000
 
-    # Mixed mode needs specific ops per stressor
-    MIXED_EXEC_OPS=200
-    MIXED_OPEN_OPS=20000
-    MIXED_MMAP_OPS=500
-
     WARMUP=1
 
     echo "============================================="
@@ -86,10 +87,6 @@ else
     BRK_OPS=1000000
     CONN_OPS=300000
     PTHREAD_OPS=20000
-
-    MIXED_EXEC_OPS=2000
-    MIXED_OPEN_OPS=100000
-    MIXED_MMAP_OPS=5000
 
     WARMUP=2
 
@@ -124,16 +121,14 @@ fi
 
 > "$RESULTS_FILE"
 
-# Drop stale per-run artifacts from any earlier session so no leftover
-# .times/.log/.txt file can ever bleed into this session's measurements.
+# Clear stale per-run artifacts so an earlier session can never bleed in.
 LIVE_PGID_FILE="/tmp/muon_live.pgid"
 rm -f /tmp/muon_*.log /tmp/muon_res_*.txt /tmp/muon_workload_err_*.txt \
   /tmp/muon_cell_*.times /tmp/muon_lastres.txt /tmp/muon_time.txt \
   /tmp/muon_lastevents.txt "$LIVE_PGID_FILE"
 
-# One session at a time: concurrent runs would fight over governors, pinned
-# cores, the results file and every /tmp channel above. Hold an exclusive
-# lock for the whole session (fd stays open, so the lock releases on exit).
+# One session at a time (shared governors, cores, results file, /tmp
+# channels). The fd stays open, so the lock releases on exit.
 exec 200>/tmp/muon_bench.lock
 if ! flock -n 200 2>/dev/null; then
   echo "ABORT: another benchmark session holds /tmp/muon_bench.lock." >&2
@@ -141,20 +136,10 @@ if ! flock -n 200 2>/dev/null; then
   exit 1
 fi
 
-# Fail fast on missing tools, before touching system state or measuring
-# anything. Lists are mode-aware: comparators only matter outside
-# --muon-only, make only for --publication, python3 only for --regress.
-require_tool() {
-  local t
-  for t in $1; do
-    command -v "$t" >/dev/null 2>&1 || {
-      echo "ABORT: required tool '$t' not found in PATH." >&2
-      exit 1
-    }
-  done
-}
+# Fail fast on missing tools, before touching system state. Lists are
+# mode-aware (comparators need --muon-only off, make needs --publication).
 [ -x /usr/bin/time ] || { echo "ABORT: /usr/bin/time missing (need GNU time for resource accounting)." >&2; exit 1; }
-require_tool "setsid taskset awk sort grep flock id python3"
+require_tool "setsid taskset awk sort grep flock id python3 go"
 require_tool "stress-ng"
 if [[ "$MUON_ONLY" -eq 0 ]]; then
   require_tool "strace perf"
@@ -169,9 +154,8 @@ else
   echo "WARNING: pkill not found — tracer shutdown falls back to group kill and tracer CPU/RSS figures will be missing." >&2
 fi
 
-# The exec workload drops privileges via sudo. Accept an explicit override
-# account (CI-as-root, doas/pkexec setups) and validate it exists; never let
-# an empty account reach the first warmup as a cryptic sudo failure.
+# The exec workload drops privileges via sudo (overridable via
+# MUON_BENCH_USER); validate the account now, not as a cryptic failure later.
 SUDO_USER="${SUDO_USER:-${MUON_BENCH_USER:-}}"
 if [ -z "$SUDO_USER" ]; then
   echo "ABORT: no unprivileged account to run the exec workload as." >&2
@@ -195,17 +179,14 @@ done
 
 restore_governors() {
   local gov_file
-  # Restore only what was actually saved; never invent a governor for a CPU
-  # whose file was unreadable at save time (or that appeared mid-session).
+  # Restore only saved entries; never invent a governor for unknown CPUs.
   for gov_file in "${!SAVED_GOVERNORS[@]}"; do
     echo "${SAVED_GOVERNORS["$gov_file"]}" > "$gov_file" 2>/dev/null
   done
 }
 
-# Last-resort session cleanup. Runs on every exit path (normal, abort,
-# Ctrl-C, SIGTERM): restores governors, reaps a tracer pipeline that an
-# external signal may have interrupted mid-run, and preserves partial
-# results when the session died abnormally.
+# Session cleanup on every exit path: restores governors, reaps a possibly
+# interrupted tracer pipeline, preserves partial results on abnormal exit.
 session_cleanup() {
   local rc=$?
   restore_governors
@@ -460,62 +441,15 @@ declare -A CELL_CPU_SUM=()
 declare -A CELL_CPU_COUNT=()
 declare -A CELL_RSS_MAX=()
 
-# Stop a tracer pipeline started as `setsid taskset ... time ... muon &`.
-# $1 is the pipeline leader PID, which (via setsid) is also its PGID.
-# Order matters: TERM the tracer (time's child) FIRST so it can print its
-# shutdown tally and — critically — so `time` observes a normal child exit
-# and writes its -v report. Only then group-kill any stragglers. Killing the
-# group outright would take `time` down before it writes the report (losing
-# CPU/RSS figures) — and killing just the leader would orphan the tracer.
-stop_muon() {
-  local leader="$1"
-  [ -n "$leader" ] || return 0
-  if [[ "${PKILL_OK:-0}" -eq 1 ]]; then
-    pkill -SIGTERM -P "$leader" 2>/dev/null
-    local w
-    for ((w=0; w<50; w++)); do
-      kill -0 "$leader" 2>/dev/null || break
-      sleep 0.1
-    done
-  fi
-  kill -SIGTERM -- "-$leader" 2>/dev/null
-  local w2
-  for ((w2=0; w2<10; w2++)); do
-    kill -0 "$leader" 2>/dev/null || break
-    sleep 0.1
-  done
-  # Escalate: a wedged tracer must never hang the session with probes
-  # attached. SIGKILL to the group, then reap the leader.
-  kill -SIGKILL -- "-$leader" 2>/dev/null
-  wait "$leader" 2>/dev/null
-  rm -f "$LIVE_PGID_FILE"
-  return 0
-}
-
-# Sanitize strings used in /tmp paths and CSV-adjacent contexts: map every
-# non-alphanumeric character (not just spaces) so a future name/tag with
-# '/', '..', '*' or ',' can neither escape /tmp nor shift CSV columns.
-safe_str() {
-  printf '%s' "$1" | tr -c '[:alnum:]_' '_'
-}
-
 # =============================================================================
 # SINGLE RUN HELPER
 # =============================================================================
 
-# Executes one full iteration: drop caches, start Muon (if any), wait for
-# readiness, run the workload, stop Muon. In timed mode the measured wall time
-# is echoed on stdout; diagnostics always go to stderr.
-# Returns:
-#   0 = clean run
-#   1 = Muon failed to become ready (run dropped)
-#   2 = invalid timing output (run dropped)
-#   3 = ring buffer full warning (run dropped)
-#   4 = Muon ran but observed zero events (run dropped)
-#   5 = workload command itself failed (run dropped)
-# When bg_cmd is set, Muon runs under /usr/bin/time -v and its CPU%/max-RSS
-# are published via /tmp/muon_lastres.txt (a file, because callers invoke this
-# function inside a command-substitution subshell that cannot export vars).
+# One full iteration: drop caches, start Muon (if any), wait for readiness,
+# run the workload, stop Muon. Timed wall time goes to stdout, diagnostics
+# to stderr. Returns 0 clean, 1 not-ready, 2 bad timing, 3 ring-full,
+# 4 zero events, 5 workload failed. Muon runs under /usr/bin/time -v;
+# CPU%/RSS publish via /tmp/muon_lastres.txt (subshell-safe file channel).
 single_run() {
   local name="$1"
   local prefix_cmd="$2"
@@ -535,21 +469,15 @@ single_run() {
   local muon_res="/tmp/muon_res_${safe_tag}.txt"
   if [ -n "$bg_cmd" ]; then
     rm -f "$muon_res"
-    # setsid puts the whole tracer pipeline (taskset/time/muon) in its own
-    # process group so teardown can signal ALL of it: killing just $! would
-    # take down `time` and orphan a still-tracing Muon on every run, leaking
-    # tracers that contaminate later cells and defeat drop/event detection.
-    # The PGID file lets the session EXIT trap reap the pipeline if an
-    # external signal interrupts this run (cleared by stop_muon on every
-    # teardown path below).
+    # setsid gives the pipeline (taskset/time/muon) its own group so teardown
+    # signals ALL of it; killing just $! orphans a still-tracing Muon.
+    # The PGID file lets the EXIT trap reap it if a signal lands mid-run.
     setsid taskset -c "$MUON_CORE" /usr/bin/time -v -o "$muon_res" $bg_cmd > "$muon_log" 2>&1 &
     muon_pid=$!
     echo "$muon_pid" > "$LIVE_PGID_FILE"
   fi
 
-  # Muon can take a few seconds to attach on a loaded host; poll for the
-  # readiness line instead of sampling once, so one slow startup cannot
-  # abort the session (core cells) or silently drop the run.
+  # Poll readiness up to 10s: one slow attach must not abort the session.
   if [ -n "$muon_pid" ]; then
     local ready=0
     local wready
@@ -582,11 +510,8 @@ single_run() {
   # timing file first so a failed/missing time never leaves stale values.
   rm -f /tmp/muon_time.txt
   local workload_err="/tmp/muon_workload_err_${safe_name}_${safe_tag}.txt"
-  # Workload stdout AND stderr both go to the per-run file: stdout must not
-  # flow into this function's stdout (it would contaminate the caller's
-  # $(...) capture — stress-ng prints its own summary to stdout), and the
-  # file preserves --metrics-brief actuals for debugging and exact op counts.
-  # Timing comes only from muon_time.txt; nothing here touches the capture.
+  # Workload stdio joins the per-run file (never this function's stdout,
+  # which feeds the $(...) capture); the file keeps --metrics-brief actuals.
   local workload_rc=0
   if [ -n "$prefix_cmd" ]; then
     /usr/bin/time -f "%e" -o /tmp/muon_time.txt \
@@ -625,15 +550,11 @@ single_run() {
     if grep -q "WARNING: Ring buffer was full" "$muon_log" 2>/dev/null; then
       drop_warning=1
     fi
-    # The last EVENTS: tally printed on shutdown is authoritative for this
-    # run: total = events accepted by the manager (parsed minus userspace
-    # drops, which are reported separately). A missing line or total=0 means
-    # Muon observed nothing. The parsed total is also published to
-    # /tmp/muon_lastevents.txt (the caller runs in a subshell, so files are
-    # the communication channel). Non-Muon runs never reach this block and
-    # never touch the file. Drop counts ride along in /tmp/muon_lastres.txt
-    # so the sweep can attribute drops even when the run's return code
-    # reflects a different failure (rc precedence).
+    # Last EVENTS tally is authoritative: total = accepted events (parsed
+    # minus userspace drops, reported separately). Missing/zero = observed
+    # nothing. Totals publish via files (callers run in a subshell).
+    # Drop counts ride in lastres.txt so the sweep sees drops even when
+    # the rc reflects a different failure.
     local last_events
     last_events=$(grep "EVENTS:" "$muon_log" 2>/dev/null | tail -n 1)
     if [[ "$last_events" =~ total=([0-9]+) ]]; then
@@ -684,10 +605,8 @@ single_run() {
   return 0
 }
 
-# Untimed warmup for one cell: WARMUP iterations via single_run, timing
-# discarded. Reports failure to the caller (which decides abort vs disable)
-# instead of exiting. Also truncates the cell's times file so runs from an
-# earlier session can never bleed into this one.
+# Untimed warmup: timing discarded, failure reported (caller aborts or
+# disables), times file truncated against earlier sessions.
 warm_cell() {
   local name="$1"
   local prefix_cmd="$2"
@@ -715,10 +634,8 @@ warm_cell() {
   done
 }
 
-# One timed iteration for one cell inside the round-robin. A valid wall time is
-# appended to the cell's times file; any failure bumps the per-cell dropped
-# counter. After a clean Muon run the resource figures published by single_run
-# in /tmp/muon_lastres.txt are folded into the per-cell accumulators.
+# One timed round: valid times append to the cell file, failures bump its
+# dropped counter, Muon CPU/RSS fold into accumulators.
 timed_round() {
   local name="$1"
   local prefix_cmd="$2"
@@ -755,10 +672,8 @@ timed_round() {
 
   if [ -n "$bg_cmd" ]; then
     local muon_cpu="" muon_rss=""
-    if [ -r /tmp/muon_lastres.txt ]; then
-      muon_cpu=$(sed -n 's/^MUON_CPU=//p' /tmp/muon_lastres.txt | tail -n 1)
-      muon_rss=$(sed -n 's/^MUON_RSS=//p' /tmp/muon_lastres.txt | tail -n 1)
-    fi
+    muon_cpu=$(tally /tmp/muon_lastres.txt MUON_CPU)
+    muon_rss=$(tally /tmp/muon_lastres.txt MUON_RSS)
     if [[ "$muon_cpu" =~ ^[0-9]+$ ]]; then
       CELL_CPU_SUM["$key"]=$(( ${CELL_CPU_SUM["$key"]:-0} + muon_cpu ))
       CELL_CPU_COUNT["$key"]=$(( ${CELL_CPU_COUNT["$key"]:-0} + 1 ))
@@ -820,11 +735,9 @@ finalize_cell() {
   echo "$category,$name,$avg,$stddev,$min,$max,$valid,$dropped,$muon_cpu,$muon_rss" >> "$RESULTS_FILE"
 }
 
-# Drives one category with interleaved rounds: warm every active cell once,
-# then alternate cells round by round so thermal drift is spread across all
-# tracers instead of biasing whichever ran last, then emit one CSV row per
-# cell. Cell specs are '|'-delimited — name|prefix_cmd|bg_cmd|workload|category
-# (no command field contains '|'; spaces are preserved).
+# Interleaved rounds per category: warm all cells, alternate them each round
+# (thermal drift hits everyone equally), emit one CSV row per cell.
+# Specs are '|' delimited (no command field contains '|').
 run_category_rounds() {
   local -a cell_specs=("$@")
   local spec name prefix_cmd bg_cmd workload category
@@ -883,12 +796,8 @@ run_category_rounds() {
 # SESSION GATE + CAPACITY SWEEP
 # =============================================================================
 
-# Functional child-tracking gate: one untimed Muon run whose workload spawns
-# GATE_CHILDREN short-lived children. Regression class caught: Muon attaches
-# and reports ready with non-zero events but stops following forked children,
-# so the children's exec/exit events silently vanish while the run still looks
-# healthy. Each child yields fork+exec+exit, so ~3K events are expected at
-# K=500; requiring >= K is the conservative floor.
+# Child-tracking gate: spawn K children under Muon, require ≥K events.
+# Catches Muon attaching fine but going blind to forked children.
 run_gate() {
   if [[ "$TRACERS_ONLY" -eq 1 ]]; then
     echo "GATE: skipping child-tracking smoke test (tracers-only mode — Muon is skipped)"
@@ -913,9 +822,7 @@ run_gate() {
   fi
 
   local gate_events=""
-  if [ -r /tmp/muon_lastevents.txt ]; then
-    gate_events=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
-  fi
+  gate_events=$(tally /tmp/muon_lastevents.txt MUON_EVENTS)
   if [[ "$gate_events" =~ ^[0-9]+$ ]] && [ "$gate_events" -ge "$gate_children" ]; then
     echo "GATE PASS: Muon observed $gate_events events from $gate_children spawned children"
   else
@@ -924,14 +831,9 @@ run_gate() {
   fi
 }
 
-# --sweep capacity scan: for each brk worker level, one untimed prime plus
-# three timed runs call single_run directly (the sweep keeps its own
-# accounting and does not reuse timed_round/finalize). Levels scale WORKERS
-# at fixed ops — not ops at fixed workers — because only concurrent syscall
-# rate moves events/sec; scaling ops merely lengthens the run at a flat
-# rate. Wall time is taken only from rc 0 runs, event totals from
-# /tmp/muon_lastevents.txt after every run; rc 3 counts as a drop and
-# rc 1/2/4/5 as a failure.
+# Sweep: prime + 3 timed runs per brk-worker level (own accounting, not
+# timed_round/finalize). Levels scale WORKERS at fixed ops — only concurrent
+# rate moves events/sec. rc 3 = drop, rc 1/2/4/5 = failure.
 run_sweep() {
   if [[ "$TRACERS_ONLY" -eq 1 ]]; then
     echo "SWEEP: skipping capacity scan — tracers-only mode runs no Muon."
@@ -975,13 +877,9 @@ run_sweep() {
       local run_out="" run_rc=0
       run_out=$(single_run "Sweep brk$lvl" "" "$sweep_bg" "$sweep_workload" 1 "Sweep brk$lvl run $r") || run_rc=$?
 
-      local ev="" dropped="0"
-      if [ -r /tmp/muon_lastevents.txt ]; then
-        ev=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
-      fi
-      if [ -r /tmp/muon_lastres.txt ]; then
-        dropped=$(sed -n 's/^MUON_DROPS=//p' /tmp/muon_lastres.txt | tail -n 1)
-      fi
+      local ev="" dropped=""
+      ev=$(tally /tmp/muon_lastevents.txt MUON_EVENTS)
+      dropped=$(tally /tmp/muon_lastres.txt MUON_DROPS)
 
       if [ "$run_rc" -eq 0 ]; then
         sweep_times+=("$run_out")
@@ -1045,11 +943,8 @@ run_sweep() {
 # Run the child-tracking gate once, before any category measures anything.
 run_gate
 
-# Map-limit probe: hold more live children than tracked_pids has entries
-# (16384) to prove overflow behavior, then reap them all (exit storm).
-# Muon-only and untimed — this is a functional limit probe, not a timing
-# comparison (strace would take forever on 18k forks). Drops are tolerated
-# and reported: the assertions are completion + substantial observed events.
+# Map-limit probe: hold more live children than tracked_pids entries (16384),
+# then reap them (exit storm). Muon-only, untimed, drops tolerated+reported.
 run_maptest() {
   if [[ "$TRACERS_ONLY" -eq 1 ]]; then
     echo "MAPTEST: skipping (tracers-only mode — Muon is skipped)"
@@ -1089,12 +984,8 @@ run_maptest() {
   fi
 
   local map_events="" map_drops=""
-  if [ -r /tmp/muon_lastevents.txt ]; then
-    map_events=$(sed -n 's/^MUON_EVENTS=//p' /tmp/muon_lastevents.txt | tail -n 1)
-  fi
-  if [ -r /tmp/muon_lastres.txt ]; then
-    map_drops=$(sed -n 's/^MUON_DROPS=//p' /tmp/muon_lastres.txt | tail -n 1)
-  fi
+  map_events=$(tally /tmp/muon_lastevents.txt MUON_EVENTS)
+  map_drops=$(tally /tmp/muon_lastres.txt MUON_DROPS)
   if [[ "$map_events" =~ ^[0-9]+$ ]] && [ "$map_events" -ge "$map_floor" ]; then
     echo "MAPTEST PASS: Muon observed $map_events events across $map_children spawned-and-reaped children (drops seen: ${map_drops:-0})"
   else
@@ -1105,92 +996,38 @@ run_maptest() {
 
 run_maptest
 
-# --- 1. EXEC-heavy ---
+# =============================================================================
+# WORKLOADS — strings first, then one table drives every category in order.
+# Row: num|title|strace_set|perf_set|workload_var|category|flags
+# Empty strace_set skips the strace cell; flags understands `kbuild_setup`.
+# =============================================================================
 EXEC_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 4 --exec-ops $EXEC_OPS"
-echo ""
-echo "========================================="
-echo " CATEGORY 1: exec-heavy"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$EXEC_WORKLOAD|exec"
-  "strace|strace -f -e trace=execve,exit -o /dev/null||$EXEC_WORKLOAD|exec"
-  "perf trace|perf trace -e execve,exit -o /dev/null --||$EXEC_WORKLOAD|exec"
-  "Muon||$MUON_BIN attach -p $$ --headless|$EXEC_WORKLOAD|exec"
-)
-run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 2. OPEN-heavy ---
 OPEN_WORKLOAD="stress-ng --open 4 --open-ops $OPEN_OPS"
-echo ""
-echo "========================================="
-echo " CATEGORY 2: openat-heavy"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$OPEN_WORKLOAD|open"
-  "strace|strace -f -e trace=openat -o /dev/null||$OPEN_WORKLOAD|open"
-  "perf trace|perf trace -e openat -o /dev/null --||$OPEN_WORKLOAD|open"
-  "Muon||$MUON_BIN attach -p $$ --headless|$OPEN_WORKLOAD|open"
-)
-run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 3. MMAP-heavy ---
 MMAP_WORKLOAD="stress-ng --mmap 4 --mmap-mprotect --mmap-bytes 4K --mmap-ops $MMAP_OPS"
-echo ""
-echo "========================================="
-echo " CATEGORY 3: mmap-heavy"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$MMAP_WORKLOAD|mmap"
-  "strace|strace -f -e trace=mmap,brk,munmap -o /dev/null||$MMAP_WORKLOAD|mmap"
-  "perf trace|perf trace -e mmap,brk,munmap -o /dev/null --||$MMAP_WORKLOAD|mmap"
-  "Muon||$MUON_BIN attach -p $$ --headless|$MMAP_WORKLOAD|mmap"
-)
-run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 6. MIXED (disabled; kept as a template for a future combined workload) ---
-# NOTE: category number 6 is deliberate — 4 and 5 are taken by go-build and
-# kernel-compile above. Uncommenting this as-is yields PerEvent '-' (the
-# mixed op count is not a single number).
-# MIXED_WORKLOAD="sudo -u \$SUDO_USER stress-ng --exec 2 --exec-ops $MIXED_EXEC_OPS --mmap 2 --mmap-mprotect --mmap-ops $MIXED_MMAP_OPS --open 2 --open-ops $MIXED_OPEN_OPS"
-# echo ""
-# echo "========================================="
-# echo " CATEGORY 4: mixed (regression test)"
-# echo "========================================="
-# CELL_SPECS=(
-#   "Baseline|||$MIXED_WORKLOAD|mixed"
-#   "strace|strace -f -e trace=execve,exit,openat,mmap,brk -o /dev/null||$MIXED_WORKLOAD|mixed"
-#   "perf trace|perf trace -e execve,exit,openat,mmap,brk -o /dev/null --||$MIXED_WORKLOAD|mixed"
-#   "Muon||$MUON_BIN attach -p $$ --headless|$MIXED_WORKLOAD|mixed"
-# )
-# run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 4. go-build ---
-# `find ... -exec touch` only refreshes mtimes of Go sources (git-neutral, no
-# content change); build output goes to /tmp so the repo stays clean. The Go
-# toolchain is checked once here, not on every run.
-if ! command -v go >/dev/null 2>&1; then
-  echo "ABORT: go toolchain not found in PATH — required for the go-build category." >&2
-  exit 1
-fi
+# `find -exec touch` refreshes Go mtimes only (git-neutral); output to /tmp.
 GOBUILD_WORKLOAD="cd \"\$SCRIPT_DIR\" && find . -name '*.go' -exec touch {} + && go build -o /tmp/muon_build_test ."
-echo ""
-echo "========================================="
-echo " CATEGORY 4: go-build"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$GOBUILD_WORKLOAD|gobuild"
-  "strace|strace -f -e trace=execve,exit,openat,mmap,brk,munmap -o /dev/null||$GOBUILD_WORKLOAD|gobuild"
-  "perf trace|perf trace -e execve,exit,openat,mmap,brk,munmap -o /dev/null --||$GOBUILD_WORKLOAD|gobuild"
-  "Muon||$MUON_BIN attach -p $$ --headless|$GOBUILD_WORKLOAD|gobuild"
-)
-run_category_rounds "${CELL_SPECS[@]}"
+# Highest sustained rate in the suite (~1M EPS); metrics preserved per-run.
+BRK_WORKLOAD="stress-ng --brk 4 --brk-ops $BRK_OPS --metrics-brief"
+# Unix-socket flood (~100k connects/s); exercises the connect Unix path.
+CONN_WORKLOAD="rm -f /tmp/muon_conn_test.sock; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py server \$(( $CONN_OPS + 60 )) & SRV=\$!; sleep 0.5; for i in \$(seq 1 50); do python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client 1 >/dev/null 2>&1 && break; sleep 0.1; done; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client $CONN_OPS; RC=\$?; kill -KILL \$SRV 2>/dev/null; wait \$SRV 2>/dev/null; rm -f /tmp/muon_conn_test.sock; exit \$RC"
+# Thread churn hits the fork probe's thread path (K1 surface).
+PTHREAD_WORKLOAD="stress-ng --pthread 4 --pthread-ops $PTHREAD_OPS"
+# -j4 matches the 4 pinned workload cores.
+KBUILD_WORKLOAD="make -C \"\$KERNEL_SRC\" clean >/dev/null && make -C \"\$KERNEL_SRC\" -j4"
 
-# --- 5. kernel-compile (--publication only) ---
-echo ""
-echo "========================================="
-echo " CATEGORY 5: kernel-compile"
-echo "========================================="
-if [ "$PUBLICATION" -eq 1 ]; then
+CATEGORY_TABLE=(
+  "1|exec-heavy|execve,exit|execve,exit|EXEC_WORKLOAD|exec|"
+  "2|openat-heavy|openat|openat|OPEN_WORKLOAD|open|"
+  "3|mmap-heavy|mmap,brk,munmap|mmap,brk,munmap|MMAP_WORKLOAD|mmap|"
+  "4|go-build|execve,exit,openat,mmap,brk,munmap|execve,exit,openat,mmap,brk,munmap|GOBUILD_WORKLOAD|gobuild|"
+  "5|kernel-compile|execve,exit,openat,mmap,brk,munmap|execve,exit,openat,mmap,brk,munmap|KBUILD_WORKLOAD|kbuild|kbuild_setup"
+  "6|brk-heavy|brk|brk|BRK_WORKLOAD|brk|"
+  "7|connect-heavy|connect|connect|CONN_WORKLOAD|connect|"
+  "8|pthread-churn||clone,clone3|PTHREAD_WORKLOAD|pthread|"
+)
+
+# One untimed defconfig + narrowed rounds for the ~10-minute kernel builds.
+kbuild_prepare() {
   KERNEL_SRC="${KERNEL_SRC:-$HOME/linux}"
   if [ ! -f "$KERNEL_SRC/Makefile" ]; then
     echo "ABORT: no kernel tree at $KERNEL_SRC (Makefile missing)." >&2
@@ -1198,88 +1035,45 @@ if [ "$PUBLICATION" -eq 1 ]; then
     exit 1
   fi
   export KERNEL_SRC
-
-  # One untimed defconfig so every timed build starts from a known config.
   if ! make -C "$KERNEL_SRC" defconfig >/dev/null 2>&1; then
     echo "ABORT: make -C $KERNEL_SRC defconfig failed." >&2
     exit 1
   fi
-
-  # Each kernel build is ~10 min, so publication uses 3 timed rounds and a
-  # single warmup; the suite defaults are restored right after.
   SAVED_ITERATIONS="$ITERATIONS"
   SAVED_WARMUP="$WARMUP"
   ITERATIONS=3
   WARMUP=1
+}
 
-  # -j4 matches the 4 cores pinned for workloads (WORKLOAD_CORES).
-  KBUILD_WORKLOAD="make -C \"\$KERNEL_SRC\" clean >/dev/null && make -C \"\$KERNEL_SRC\" -j4"
-  CELL_SPECS=(
-    "Baseline|||$KBUILD_WORKLOAD|kbuild"
-    "strace|strace -f -e trace=execve,exit,openat,mmap,brk,munmap -o /dev/null||$KBUILD_WORKLOAD|kbuild"
-    "perf trace|perf trace -e execve,exit,openat,mmap,brk,munmap -o /dev/null --||$KBUILD_WORKLOAD|kbuild"
-    "Muon||$MUON_BIN attach -p $$ --headless|$KBUILD_WORKLOAD|kbuild"
-  )
-  run_category_rounds "${CELL_SPECS[@]}"
-
-  ITERATIONS="$SAVED_ITERATIONS"
-  WARMUP="$SAVED_WARMUP"
-else
-  echo "  [publication-skip] kernel-compile requires --publication"
-fi
-
-# --- 6. brk-heavy ---
-# A bare-syscall loop: ~400k+ bogo ops/s, each firing enter+exit probes, so
-# this is the highest sustained event rate in the suite (~1M EPS) and the
-# first workload that genuinely pressures the ring buffer. --metrics-brief
-# actuals land in the per-run file (stdout is preserved there, not discarded).
-BRK_WORKLOAD="stress-ng --brk 4 --brk-ops $BRK_OPS --metrics-brief"
-echo ""
-echo "========================================="
-echo " CATEGORY 6: brk-heavy"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$BRK_WORKLOAD|brk"
-  "strace|strace -f -e trace=brk -o /dev/null||$BRK_WORKLOAD|brk"
-  "perf trace|perf trace -e brk -o /dev/null --||$BRK_WORKLOAD|brk"
-  "Muon||$MUON_BIN attach -p $$ --headless|$BRK_WORKLOAD|brk"
-)
-run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 7. connect-heavy ---
-# Unix-socket connect flood via bench/conn_flood.py (self-contained, no
-# listener setup needed): ~100k connects/s single-threaded, one enter event
-# each, exercising the connect probe — including its Unix-socket path —
-# for the first time. No port exhaustion, no TIME_WAIT backlog.
-CONN_WORKLOAD="rm -f /tmp/muon_conn_test.sock; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py server \$(( $CONN_OPS + 60 )) & SRV=\$!; sleep 0.5; for i in \$(seq 1 50); do python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client 1 >/dev/null 2>&1 && break; sleep 0.1; done; python3 \"\$SCRIPT_DIR\"/bench/conn_flood.py client $CONN_OPS; RC=\$?; kill -KILL \$SRV 2>/dev/null; wait \$SRV 2>/dev/null; rm -f /tmp/muon_conn_test.sock; exit \$RC"
-echo ""
-echo "========================================="
-echo " CATEGORY 7: connect-heavy"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$CONN_WORKLOAD|connect"
-  "strace|strace -f -e trace=connect -o /dev/null||$CONN_WORKLOAD|connect"
-  "perf trace|perf trace -e connect -o /dev/null --||$CONN_WORKLOAD|connect"
-  "Muon||$MUON_BIN attach -p $$ --headless|$CONN_WORKLOAD|connect"
-)
-run_category_rounds "${CELL_SPECS[@]}"
-
-# --- 8. pthread-churn ---
-# Rapid thread create/join: exercises the fork probe's thread path (the K1
-# TID surface) plus map insert/delete churn at ~60k ops/s. strace is
-# deliberately excluded — ptrace thread-following slows this workload ~50x
-# and the comparison adds no information; perf (tracepoints) stays.
-PTHREAD_WORKLOAD="stress-ng --pthread 4 --pthread-ops $PTHREAD_OPS"
-echo ""
-echo "========================================="
-echo " CATEGORY 8: pthread-churn"
-echo "========================================="
-CELL_SPECS=(
-  "Baseline|||$PTHREAD_WORKLOAD|pthread"
-  "perf trace|perf trace -e clone,clone3 -o /dev/null --||$PTHREAD_WORKLOAD|pthread"
-  "Muon||$MUON_BIN attach -p $$ --headless|$PTHREAD_WORKLOAD|pthread"
-)
-run_category_rounds "${CELL_SPECS[@]}"
+run_all_categories() {
+  local row num title strace_set perf_set wl_var category flags workload
+  local -a specs
+  for row in "${CATEGORY_TABLE[@]}"; do
+    IFS='|' read -r num title strace_set perf_set wl_var category flags <<< "$row"
+    workload="${!wl_var}"
+    echo ""
+    echo "========================================="
+    echo " CATEGORY $num: $title"
+    echo "========================================="
+    if [[ "$flags" == *kbuild_setup* ]]; then
+      if [[ "$PUBLICATION" -ne 1 ]]; then
+        echo "  [publication-skip] kernel-compile requires --publication"
+        continue
+      fi
+      kbuild_prepare
+    fi
+    specs=("Baseline|||$workload|$category")
+    [ -n "$strace_set" ] && specs+=("strace|strace -f -e trace=$strace_set -o /dev/null||$workload|$category")
+    specs+=("perf trace|perf trace -e $perf_set -o /dev/null --||$workload|$category")
+    specs+=("Muon||$MUON_BIN attach -p $$ --headless|$workload|$category")
+    run_category_rounds "${specs[@]}"
+    if [[ "$flags" == *kbuild_setup* ]]; then
+      ITERATIONS="$SAVED_ITERATIONS"
+      WARMUP="$SAVED_WARMUP"
+    fi
+  done
+}
+run_all_categories
 
 # --- Capacity sweep (--sweep only) ---
 if [[ "$SWEEP" -eq 1 ]]; then
@@ -1425,193 +1219,10 @@ run_regress() {
     return 2
   fi
 
-  # CSV overheads are recomputed from raw avg/stddev with the same formulas as
-  # the awk summary; the baseline stores independently measured overheads, so
-  # only the deltas between the two are comparable.
-  python3 - "$RESULTS_FILE" "$BASELINE_JSON" "$REGRESS" <<'PY'
-import json
-import math
-import re
-import sys
-
-
-def main():
-    csv_path, baseline_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
-
-    try:
-        with open(baseline_path) as fh:
-            baseline = json.load(fh)
-    except (OSError, ValueError) as exc:
-        print(f"REGRESS ERROR: cannot read baseline {baseline_path}: {exc}", file=sys.stderr)
-        return 2
-
-    # Fail closed on wrong-shaped baselines (a list, a string cells map, a
-    # non-numeric capacity): comparing against garbage must never pass.
-    if not isinstance(baseline, dict) or not isinstance(baseline.get("cells", {}), dict):
-        print(f"REGRESS ERROR: baseline {baseline_path} has no object 'cells' map", file=sys.stderr)
-        return 2
-
-    base_cells = baseline.get("cells") or {}
-    base_cap = baseline.get("capacity_ev_per_s")
-    if base_cap is not None and (isinstance(base_cap, bool) or not isinstance(base_cap, (int, float))):
-        print(f"REGRESS ERROR: baseline capacity_ev_per_s is not a number", file=sys.stderr)
-        return 2
-
-    base_rows = {}
-    new_cells = {}
-    invalid = set()
-    sweep_best = None
-
-    try:
-        with open(csv_path) as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("coremap:"):
-                    continue
-                if line.startswith("sweep:"):
-                    ev = re.search(r"ev_per_s=(\d+)", line)
-                    st = re.search(r"status=(\w+)", line)
-                    if ev and st and st.group(1) == "CLEAN":
-                        val = int(ev.group(1))
-                        if sweep_best is None or val > sweep_best:
-                            sweep_best = val
-                    continue
-                parts = line.split(",")
-                if len(parts) < 4:
-                    continue
-                cat, name, avg_s = parts[0], parts[1], parts[2]
-                key = f"{cat}:{name}"
-                if avg_s == "INVALID":
-                    invalid.add(key)
-                    continue
-                try:
-                    avg = float(avg_s)
-                    sd = float(parts[3])
-                except ValueError:
-                    continue
-                if name == "Baseline":
-                    base_rows[cat] = (avg, sd)
-                else:
-                    new_cells[key] = (avg, sd)
-    except OSError as exc:
-        print(f"REGRESS ERROR: cannot read results {csv_path}: {exc}", file=sys.stderr)
-        return 2
-
-    # A null/missing stored overhead means "no baseline for this cell" (e.g.
-    # the baseline came from a partial run) — SKIP, never default to 0.0,
-    # which would manufacture a false FAIL against any real measurement.
-    def baseline_oh_err(key):
-        cell = base_cells.get(key)
-        if not isinstance(cell, dict):
-            return None
-        oh, er = cell.get("overhead_pct"), cell.get("overhead_err")
-        if oh is None or er is None:
-            return None
-        try:
-            return float(oh), float(er)
-        except (TypeError, ValueError):
-            return None
-
-    rows = []
-    notes = []
-    fails = 0
-    warns = 0
-
-    for key in sorted(new_cells):
-        cat = key.split(":", 1)[0]
-        base = base_rows.get(cat)
-        if base is None or base[0] == 0:
-            if key in base_cells:
-                rows.append((key, baseline_oh_err(key)[0], None, None, "SKIP"))
-            notes.append(f"REGRESS NOTE: {key} skipped — no Baseline cell for '{cat}' in this run")
-            continue
-        if key not in base_cells:
-            notes.append(f"REGRESS NOTE: {key} is NEW (not in baseline; info only)")
-            continue
-
-        T, St = new_cells[key]
-        B, Sb = base
-        new_oh = (T - B) / B * 100.0
-        new_err = 100.0 * math.sqrt((St / B) ** 2 + (T * Sb / (B * B)) ** 2)
-        bo = baseline_oh_err(key)
-        if bo is None:
-            rows.append((key, None, new_oh, None, "SKIP"))
-            notes.append(f"REGRESS NOTE: {key} skipped — no stored overhead in baseline (partial baseline?)")
-            continue
-        base_oh, base_err = bo
-        gap = new_oh - base_oh
-        noise = 2.0 * math.sqrt(new_err ** 2 + base_err ** 2)
-        # EPS keeps IEEE754 dust (e.g. 3.000000000000007) from flipping a
-        # verdict sitting exactly on a threshold.
-        EPS = 1e-9
-
-        if gap > 3.0 + EPS and gap > noise:
-            if mode == "fail":
-                verdict = "FAIL"
-                fails += 1
-            else:
-                verdict = "WARN"
-                warns += 1
-        elif gap > 3.0 + EPS:
-            verdict = "WARN"
-            warns += 1
-        elif gap < -3.0 - EPS and abs(gap) > noise:
-            verdict = "IMPROVED"
-        else:
-            verdict = "OK"
-        rows.append((key, base_oh, new_oh, gap, verdict))
-
-    for key in sorted(base_cells):
-        if key in new_cells:
-            continue
-        if key.split(":", 1)[-1] == "Baseline":
-            continue  # reference row, not a candidate — no note, no row
-        state = "INVALID in this run" if key in invalid else "missing from this run"
-        stored = baseline_oh_err(key)
-        rows.append((key, stored[0] if stored else None, None, None, "SKIP"))
-        notes.append(f"REGRESS NOTE: {key} skipped ({state}; never fails)")
-
-    print("")
-    print("REGRESS REPORT")
-    print(f"{'Cell':<26} {'Base%':>9} {'New%':>9} {'Gap':>9}  Verdict")
-    print("-" * 68)
-    for key, base_oh, new_oh, gap, verdict in rows:
-        b = "n/a" if base_oh is None else f"{base_oh:+.2f}"
-        n = "n/a" if new_oh is None else f"{new_oh:+.2f}"
-        g = "n/a" if gap is None else f"{gap:+.2f}"
-        print(f"{key:<26} {b:>9} {n:>9} {g:>9}  {verdict}")
-    for note in notes:
-        print(note)
-
-    if sweep_best is not None and base_cap is not None:
-        # Boundary is exclusive and exact: integers on both sides, so exactly
-        # 80% passes. Advisory only — capacity never fails a run.
-        if base_cap and sweep_best < 0.8 * base_cap:
-            warns += 1
-            print(f"REGRESS CAPACITY: WARN — CLEAN {sweep_best} events/s < 0.8 x baseline {base_cap} events/s")
-        else:
-            print(f"REGRESS CAPACITY: OK — CLEAN {sweep_best} events/s vs baseline {base_cap} events/s")
-    elif sweep_best is not None:
-        print(f"REGRESS CAPACITY: {sweep_best} events/s (baseline has no capacity figure; info only)")
-    else:
-        print("REGRESS CAPACITY: no CLEAN sweep in this run (info only)")
-
-    if fails > 0:
-        # fails can only be non-zero in fail mode (warn mode counts them as
-        # WARN above), so this is unconditionally a failure.
-        print(f"REGRESS FAIL ({fails})")
-        return 1
-    if warns > 0:
-        print(f"REGRESS PASS ({warns} warning(s))")
-    else:
-        print("REGRESS PASS")
-    return 0
-
-
-sys.exit(main())
-PY
+  # Comparison logic lives in bench/regress.py (same formulas as the awk
+  # summary; the baseline stores independently measured overheads, so
+  # only the deltas between the two are comparable).
+  python3 "$SCRIPT_DIR/bench/regress.py" "$RESULTS_FILE" "$BASELINE_JSON" "$REGRESS"
 }
 
 if [[ "$REGRESS" != "off" ]]; then

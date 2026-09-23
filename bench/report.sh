@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
-# =============================================================================
-# bench/report.sh — render an archived benchmark run as markdown / baseline
-# =============================================================================
-#
-# Usage:
-#   bench/report.sh [results-dir] [--stdout] [--init-baseline]
-#
-#   results-dir      archive directory containing results.csv and env.txt
-#                    (default: newest bench/results/*/ by mtime)
-#   --stdout         print the generated markdown; touch no files at all
-#   --init-baseline  write bench/baseline.json from the run and exit
-#
-# Reads CSV v2 rows: category,name,avg,stddev,min,max,valid,dropped,
-# muon_cpu_pct,muon_rss_kb. Pure bash + awk.
+# report.sh: render an archived run as markdown, or mint bench/baseline.json.
+# Usage: report.sh [results-dir] [--stdout] [--init-baseline]
+# (default dir: newest bench/results/*/; --stdout touches no files).
+# Reads CSV v2 rows. Pure bash + awk.
 
 export LC_ALL=C
 export LC_NUMERIC=C

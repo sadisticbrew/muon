@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# probe_cost.sh - measure Muon's in-kernel per-probe cost via BPF run-time stats.
-#
-# Standalone companion to benchmark_muon.sh: attaches Muon, runs a fixed
-# stress-ng open() load, then diffs bpftool run_cnt/run_time_ns across the load.
-# Attribution is by program id set: ids present after attach but absent before
-# are Muon's, so unrelated system BPF programs can never pollute the table.
-# The "after" snapshot is taken while still attached because cilium/ebpf
-# unloads the programs on exit; a post-teardown snapshot would show none.
+# probe_cost.sh: Muon's in-kernel per-probe cost via BPF run-time stats.
+# Attaches Muon, runs a fixed open() load, diffs bpftool run_cnt/run_time_ns.
+# Attribution is by attach-time program id set, so unrelated system BPF
+# programs can't pollute the table. The "after" snapshot precedes teardown
+# because exiting unloads the programs.
 # Usage: sudo bench/probe_cost.sh
 set -u
 export LC_NUMERIC=C
@@ -22,6 +19,14 @@ for tool in bpftool taskset stress-ng python3 setsid; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
 done
 [ -x "$MUON_BIN" ] || fail "Muon binary not found: $MUON_BIN (run 'make build')"
+if command -v pkill >/dev/null 2>&1; then PKILL_OK=1; else PKILL_OK=0; fi
+
+# Shared teardown lives in lib.sh (graceful TERM first so `time`/tally
+# equivalents complete, SIGKILL escalation, no orphaned tracers).
+LIB_SH="$SCRIPT_DIR/lib.sh"
+[ -f "$LIB_SH" ] || fail "lib.sh missing at $LIB_SH"
+# shellcheck disable=SC1091
+. "$LIB_SH"
 
 STATS_FILE=/proc/sys/kernel/bpf_stats_enabled
 [ -w "$STATS_FILE" ] || fail "kernel lacks BPF stats (needs 5.1+)"
@@ -35,24 +40,6 @@ AFTER="$WORKDIR/after.json"
 LEADER=""
 
 restore_stats() { echo "$ORIG_STATS" > "$STATS_FILE" 2>/dev/null || true; }
-
-# Stop a `setsid taskset ... muon &` pipeline: TERM the tracer child first so
-# it exits cleanly and unloads its BPF programs, then group-kill stragglers.
-stop_muon() {
-  local leader="$1"
-  [ -n "$leader" ] || return 0
-  if command -v pkill >/dev/null 2>&1; then
-    pkill -SIGTERM -P "$leader" 2>/dev/null
-    local w
-    for ((w = 0; w < 50; w++)); do
-      kill -0 "$leader" 2>/dev/null || break
-      sleep 0.1
-    done
-  fi
-  kill -SIGTERM -- "-$leader" 2>/dev/null
-  wait "$leader" 2>/dev/null
-  return 0
-}
 
 finish() {
   local rc=$?
@@ -89,15 +76,13 @@ if [ "$ready" -ne 1 ]; then
   fail "Muon failed to start"
 fi
 
-# Mid snapshot: program ids present here but absent from BEFORE are Muon's.
-# (An id present in both could theoretically have been recycled between the
-# snapshots; matching by id AND name below keeps that from attributing
-# another program's runs to Muon.)
+# Mid snapshot defines Muon's id set; name matching below guards against
+# kernel id recycling between snapshots.
 bpftool -j prog show > "$MID" || fail "bpftool prog show (mid) failed"
 
 # --- fixed load while attached -----------------------------------------------
-# A failed load invalidates the whole measurement: deltas near zero would
-# otherwise print as a clean-looking empty table with exit 0.
+# A failed load invalidates the measurement (near-zero deltas would print
+# as a clean-looking empty table with exit 0).
 taskset -c 4,5,6,7 stress-ng --open 4 --open-ops 200000 >/dev/null 2>&1 \
   || fail "stress-ng load failed (artifacts kept in $WORKDIR)"
 
@@ -123,11 +108,8 @@ def num(prog, key):
 
 before, mid, after = (load(p) for p in sys.argv[1:4])
 
-# Muon's programs are the ids that appear at attach time: fresh ids absent
-# from BEFORE, plus recycled ids whose name changed to a trace_* program
-# (Muon's C functions are all trace_*; bpftool truncates to 15 chars).
-# Deltas are mid→after (the load window); an id that vanished or changed
-# names again since is unattributable and skipped.
+# Muon's ids: fresh at attach, plus recycled ids renamed to trace_*.
+# Deltas are mid→after (the load window); vanished/renamed ids are skipped.
 muon_ids = {}
 for pid, prog in mid.items():
     name = prog.get("name", "?")
